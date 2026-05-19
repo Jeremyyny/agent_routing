@@ -288,7 +288,7 @@ demonstrations from ordinary training examples.
 Command:
 
 ```powershell
-python -X utf8 -m src.pipeline.cli manager_coldstart_sft --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --coldstart_n_samples 300 --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+python -X utf8 -m src.pipeline.cli manager_coldstart_sft --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\reasoner_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\rule_applier_runtime_raw_sft.jsonl --coldstart_n_samples 300 --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
 ```
 
 What it does:
@@ -337,7 +337,7 @@ can produce two or three per-turn SFT rows.
 Optional teacher routing:
 
 ```powershell
-python -X utf8 -m src.pipeline.cli manager_coldstart_sft --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --coldstart_n_samples 300 --teacher_provider openai --teacher_model gpt-4o-mini --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+python -X utf8 -m src.pipeline.cli manager_coldstart_sft --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\reasoner_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\rule_applier_runtime_raw_sft.jsonl --coldstart_n_samples 300 --teacher_provider openai --teacher_model gpt-4o-mini --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
 ```
 
 With a teacher, the teacher chooses the tool sequence. The final answer is still
@@ -369,22 +369,43 @@ outputs/manager/openai_us4_500_runtime_raw/sft_evolved
 
 ## GRPO Manager Training
 
-Start GRPO from the cold-start manager adapter:
+There are two manager GRPO modes:
+
+- Full-parameter GRPO: pass `--mgr_full_parameter_rl`. The manager SFT adapter
+  is merged into the base model, then all manager weights are trainable. This
+  saves a full model under the requested output directory.
+- LoRA-adapter GRPO: omit `--mgr_full_parameter_rl`. Only the manager LoRA
+  adapter is trained and saved.
+
+Recommended full-parameter GRPO from the cold-start manager adapter:
 
 ```powershell
-python -X utf8 -m src.pipeline.cli train_manager_grpo --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --mgr_init_adapter outputs\manager\openai_us4_500_runtime_raw\sft_evolved --mgr_bs 4 --mgr_num_generations 4 --mgr_max_completion_length 2048 --mgr_temperature 1.0 --mgr_grpo_beta 0.01 --mgr_tool_use_bonus 0.2 --mgr_max_steps 200 --mgr_use_wandb --wandb_project agent_routing --wandb_run_name openai_us4_500_runtime_raw_grpo_after_coldstart --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+python -X utf8 -m src.pipeline.cli train_manager_grpo --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\reasoner_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\rule_applier_runtime_raw_sft.jsonl --mgr_init_adapter outputs\manager\openai_us4_500_runtime_raw\sft_evolved --mgr_full_parameter_rl --mgr_output_dir outputs\manager\openai_us4_500_runtime_raw\grpo_full --mgr_bs 2 --mgr_num_generations 2 --mgr_max_completion_length 2048 --mgr_temperature 1.0 --mgr_grpo_beta 0.01 --mgr_tool_use_bonus 0.2 --mgr_max_steps 200 --mgr_use_wandb --wandb_project agent_routing --wandb_run_name openai_us4_500_runtime_raw_grpo_full_after_coldstart --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+```
+
+Optional LoRA-adapter GRPO if full-parameter training is too expensive:
+
+```powershell
+python -X utf8 -m src.pipeline.cli train_manager_grpo --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\reasoner_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\rule_applier_runtime_raw_sft.jsonl --mgr_init_adapter outputs\manager\openai_us4_500_runtime_raw\sft_evolved --mgr_output_dir outputs\manager\openai_us4_500_runtime_raw\grpo_lora --mgr_bs 4 --mgr_num_generations 4 --mgr_max_completion_length 2048 --mgr_temperature 1.0 --mgr_grpo_beta 0.01 --mgr_tool_use_bonus 0.2 --mgr_max_steps 200 --mgr_use_wandb --wandb_project agent_routing --wandb_run_name openai_us4_500_runtime_raw_grpo_lora_after_coldstart --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
 ```
 
 Key parameters:
 
 - `--train_size 1200`: size of the MedQA train pool before exclusions.
-- `--exclude_sft_example_ids ...`: removes subagent SFT examples from manager GRPO.
-- `--mgr_bs 4`: GRPO generation batch size. With current TRL this must be divisible by `--mgr_num_generations`.
-- `--mgr_num_generations 4`: rollout count per prompt group.
+- `--exclude_sft_example_ids ...`: removes subagent SFT examples from manager GRPO train rows.
+- `--mgr_full_parameter_rl`: merge the init adapter and update all manager weights.
+- `--mgr_output_dir ...\grpo_full`: keep full-parameter GRPO separate from older adapter runs.
+- `--mgr_bs`: GRPO generation batch size. With current TRL this must be divisible by `--mgr_num_generations`.
+- `--mgr_num_generations`: rollout count per prompt group.
 - `--mgr_max_steps 200`: optimizer update steps, not tool-call steps.
 - `--mgr_max_completion_length 2048`: max generated tokens per rollout.
 - `--mgr_tool_use_bonus 0.2`: bonus only when the answer is correct and at least one native tool call was used.
 - `--mgr_init_adapter ...`: initializes GRPO from the cold-start manager SFT adapter.
+
+After full-parameter GRPO, the output directory should contain `config.json`
+and full model weights such as `model.safetensors` or sharded safetensors. If
+it only contains `adapter_config.json` and `adapter_model.safetensors`, that run
+was adapter GRPO, not full-parameter GRPO.
 
 Per-rollout tool calling is capped in code by:
 
@@ -439,13 +460,20 @@ SFT stages currently log to terminal only (`report_to=[]`).
 After GRPO, failures are written to:
 
 ```text
-outputs/manager/<teacher_id>/grpo/fail_buffer.jsonl
+outputs/manager/<teacher_id>/grpo_full/fail_buffer.jsonl
 ```
 
 You can turn failures into more manager SFT data:
 
 ```powershell
 python -X utf8 -m src.pipeline.cli evolve_build_sft --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+```
+
+If you used a custom GRPO output directory, pass its failure buffer explicitly
+when building evolve SFT from that run:
+
+```powershell
+python -X utf8 -m src.pipeline.cli evolve_build_sft --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions." --fail_buffer_jsonl outputs\manager\openai_us4_500_runtime_raw\grpo_full\fail_buffer.jsonl
 ```
 
 Then SFT manager on that failure-driven data:
@@ -475,9 +503,21 @@ Manager eval:
 python -X utf8 -m src.pipeline.cli eval_manager --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --eval_n_samples 200
 ```
 
-Note: current `eval_manager` is simple generation and does not fully reproduce
-the GRPO native tool-calling rollout loop. Use GRPO traces for tool-call behavior
-analysis:
+Manager eval with frozen subagents as tools:
+
+```powershell
+python -X utf8 -m src.pipeline.cli eval_manager_tools --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --eval_n_samples 1270 --test_size 1270 --eval_manager_dir outputs\manager\openai_us4_500_runtime_raw\grpo_full --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+```
+
+LegalBench manager tool eval:
+
+```powershell
+python -X utf8 -m src.pipeline.cli eval_manager_tools --teacher_id openai_us4_500_runtime_raw --legalbench_normalized_cache outputs\data\legalbench_abercrombie.jsonl --eval_n_samples 200 --eval_manager_dir outputs\manager\openai_us4_500_runtime_raw\grpo_full --task_description "You are a manager agent solving a LegalBench multiple-choice classification task."
+```
+
+Note: `eval_manager` is simple generation without tool execution.
+Use `eval_manager_tools` for accuracy with frozen subagents in the loop, and
+use GRPO traces for training-time tool-call behavior analysis:
 
 ```text
 outputs/manager/<teacher_id>/grpo/train_raw_trace.jsonl
@@ -527,6 +567,12 @@ and run training with `python -X utf8`.
 
 Newer TRL requires the generation batch size to be divisible by
 `num_generations`. Use:
+
+```text
+--mgr_bs 2 --mgr_num_generations 2
+```
+
+or:
 
 ```text
 --mgr_bs 4 --mgr_num_generations 4
@@ -584,9 +630,12 @@ python -X utf8 -m src.pipeline.cli train_subagent --teacher_id openai_us4_500_ru
 python -X utf8 -m src.pipeline.cli train_subagent --teacher_id openai_us4_500_runtime_raw --agent_kind rule_applier --sft_train_jsonl outputs\sft_data\openai_us4_500\rule_applier_runtime_raw_sft.jsonl --sft_epochs 3 --sft_lr 2e-4
 
 # 3. Build and train manager cold-start SFT
-python -X utf8 -m src.pipeline.cli manager_coldstart_sft --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --coldstart_n_samples 300 --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+python -X utf8 -m src.pipeline.cli manager_coldstart_sft --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\reasoner_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\rule_applier_runtime_raw_sft.jsonl --coldstart_n_samples 300 --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
 python -X utf8 -m src.pipeline.cli train_manager_sft --teacher_id openai_us4_500_runtime_raw --manager_sft_train_jsonl outputs\manager\openai_us4_500_runtime_raw\evolve\manager_sft_coldstart.jsonl --manager_sft_epochs 1 --manager_sft_lr 2e-5
 
-# 4. GRPO from cold-start manager
-python -X utf8 -m src.pipeline.cli train_manager_grpo --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --mgr_init_adapter outputs\manager\openai_us4_500_runtime_raw\sft_evolved --mgr_bs 4 --mgr_num_generations 4 --mgr_max_completion_length 2048 --mgr_temperature 1.0 --mgr_grpo_beta 0.01 --mgr_tool_use_bonus 0.2 --mgr_max_steps 200 --mgr_use_wandb --wandb_project agent_routing --wandb_run_name openai_us4_500_runtime_raw_grpo_after_coldstart --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+# 4. Full-parameter GRPO from cold-start manager
+python -X utf8 -m src.pipeline.cli train_manager_grpo --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --train_size 1200 --exclude_sft_example_ids outputs\sft_data\openai_us4_500\extractor_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\reasoner_runtime_raw_sft.jsonl --exclude_sft_example_ids outputs\sft_data\openai_us4_500\rule_applier_runtime_raw_sft.jsonl --mgr_init_adapter outputs\manager\openai_us4_500_runtime_raw\sft_evolved --mgr_full_parameter_rl --mgr_output_dir outputs\manager\openai_us4_500_runtime_raw\grpo_full --mgr_bs 2 --mgr_num_generations 2 --mgr_max_completion_length 2048 --mgr_temperature 1.0 --mgr_grpo_beta 0.01 --mgr_tool_use_bonus 0.2 --mgr_max_steps 200 --mgr_use_wandb --wandb_project agent_routing --wandb_run_name openai_us4_500_runtime_raw_grpo_full --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+
+# 5. Evaluate the full-parameter GRPO manager on MedQA test
+python -X utf8 -m src.pipeline.cli eval_manager_tools --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --eval_manager_dir outputs\manager\openai_us4_500_runtime_raw\grpo_full --eval_n_samples 1270 --test_size 1270 --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
 ```

@@ -9,4 +9,5 @@ from .stages import (
     run_evolve_round,
     run_eval_subagents,
     run_eval_manager,
+    run_eval_manager_tools,
 )

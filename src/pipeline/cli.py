@@ -48,6 +48,7 @@ def _parse_args() -> argparse.Namespace:
         "evolve_round",
         "eval_subagents",
         "eval_manager",
+        "eval_manager_tools",
     ])
 
     # Context-level flags
@@ -128,7 +129,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mgr_routing_efficiency_bonus", type=float, default=0.0)
     parser.add_argument("--mgr_tool_use_bonus", type=float, default=0.0,
                         help="Bonus added only when the final answer is correct and at least one native tool was called.")
+    parser.add_argument("--mgr_full_parameter_rl", action="store_true",
+                        help="Run full-parameter GRPO. If --mgr_init_adapter is set, merge it into the base model first.")
     parser.add_argument("--mgr_max_steps", type=int, default=-1)
+    parser.add_argument("--mgr_output_dir", type=str, default="",
+                        help="Optional explicit output directory for train_manager_grpo.")
     parser.add_argument("--mgr_use_wandb", action="store_true")
     parser.add_argument("--mgr_init_adapter", type=str, default="",
                         help="Optional manager LoRA adapter to initialize GRPO from, e.g. outputs/manager/<id>/sft_evolved.")
@@ -141,6 +146,8 @@ def _parse_args() -> argparse.Namespace:
 
     # Evolve
     parser.add_argument("--evolve_max_fail_samples", type=int, default=1500)
+    parser.add_argument("--fail_buffer_jsonl", type=str, default="",
+                        help="Optional explicit GRPO fail_buffer.jsonl path for evolve_build_sft.")
     parser.add_argument("--coldstart_n_samples", type=int, default=300)
     parser.add_argument("--manager_sft_train_jsonl", type=str, default="",
                         help="Optional explicit manager SFT JSONL for train_manager_sft.")
@@ -151,6 +158,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_n_samples", type=int, default=100)
     parser.add_argument("--eval_kinds", type=str, default="extractor,reasoner,rule_applier")
     parser.add_argument("--eval_manager_dir", type=str, default="")
+    parser.add_argument("--eval_temperature", type=float, default=0.0)
+    parser.add_argument("--eval_max_new_tokens", type=int, default=1024)
+    parser.add_argument("--eval_max_tool_calls", type=int, default=3)
 
     return parser.parse_args()
 
@@ -210,6 +220,21 @@ def _load_legalbench_or_cache(args) -> List[StandardRow]:
         rows = [StandardRow(**r) for r in read_jsonl(cache)]
         print(f"[LOAD_LEGALBENCH] loaded cached {len(rows)} rows -> {cache}")
     return rows
+
+
+def _load_eval_rows(args) -> List[StandardRow]:
+    """Load the benchmark requested for evaluation.
+
+    LegalBench is selected when an explicit LegalBench cache/config is passed;
+    otherwise we preserve the existing MedQA default.
+    """
+    if args.legalbench_normalized_cache or args.legalbench_configs:
+        rows = _load_legalbench_or_cache(args)
+        preferred = [r for r in rows if (r.split or "").lower() in {"test", "dev", "validation"}]
+        return preferred or rows
+
+    data = _load_or_split(args)
+    return data["test"] or data["dev"]
 
 
 def _exclude_sft_rows(rows: List[StandardRow], paths: List[str]) -> List[StandardRow]:
@@ -345,7 +370,9 @@ def main() -> None:
             grpo_beta=args.mgr_grpo_beta,
             routing_efficiency_bonus=args.mgr_routing_efficiency_bonus,
             tool_use_bonus=args.mgr_tool_use_bonus,
+            full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
+            output_dir=(args.mgr_output_dir or None),
             use_wandb=args.mgr_use_wandb,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
@@ -361,6 +388,7 @@ def main() -> None:
             ctx=ctx, rows=data["all"],
             teacher_provider=(args.teacher_provider or None),
             teacher_model=(args.teacher_model or None),
+            fail_buffer_jsonl=(args.fail_buffer_jsonl or None),
             max_fail_samples=args.evolve_max_fail_samples,
             task_description=args.task_description,
         )
@@ -408,7 +436,9 @@ def main() -> None:
             grpo_beta=args.mgr_grpo_beta,
             routing_efficiency_bonus=args.mgr_routing_efficiency_bonus,
             tool_use_bonus=args.mgr_tool_use_bonus,
+            full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
+            output_dir=(args.mgr_output_dir or None),
             use_wandb=args.mgr_use_wandb,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
@@ -448,14 +478,28 @@ def main() -> None:
         return
 
     if args.stage == "eval_manager":
-        data = _load_or_split(args)
         result = stages.run_eval_manager(
-            ctx=ctx, rows=data["test"] or data["dev"],
+            ctx=ctx, rows=_load_eval_rows(args),
             manager_dir=(args.eval_manager_dir or None),
             n_samples=args.eval_n_samples,
+            temperature=args.eval_temperature,
+            max_new_tokens=args.eval_max_new_tokens,
             task_description=args.task_description,
         )
         print("[EVAL_MANAGER]", result)
+        return
+
+    if args.stage == "eval_manager_tools":
+        result = stages.run_eval_manager_tools(
+            ctx=ctx, rows=_load_eval_rows(args),
+            manager_dir=(args.eval_manager_dir or None),
+            n_samples=args.eval_n_samples,
+            temperature=args.eval_temperature,
+            max_new_tokens=args.eval_max_new_tokens,
+            max_tool_calls=args.eval_max_tool_calls,
+            task_description=args.task_description,
+        )
+        print("[EVAL_MANAGER_TOOLS]", result)
         return
 
     sys.exit(f"Unknown stage: {args.stage}")

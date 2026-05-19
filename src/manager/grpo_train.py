@@ -193,6 +193,7 @@ class ManagerGRPOConfig:
     max_steps: int = -1
     routing_efficiency_bonus: float = 0.0
     tool_use_bonus: float = 0.0
+    full_parameter_rl: bool = False      # if true, merge init adapter and train all model weights
     binding_mode: str = "auto"           # auto | environment | argument
     use_wandb: bool = False
     wandb_project: str = "agent_routing"
@@ -306,16 +307,40 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
             pass
 
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    manager_model = AutoModelForCausalLM.from_pretrained(
-        cfg.base_model, torch_dtype=dtype, trust_remote_code=True
-    ).to(device)
-    if cfg.manager_adapter:
-        if not PEFT_AVAILABLE:
-            raise RuntimeError("peft is required to load --mgr_init_adapter.")
-        manager_model = PeftModel.from_pretrained(
-            manager_model, cfg.manager_adapter, is_trainable=True
+    is_full_init = (
+        cfg.manager_adapter
+        and os.path.isdir(cfg.manager_adapter)
+        and os.path.exists(os.path.join(cfg.manager_adapter, "config.json"))
+        and not os.path.exists(os.path.join(cfg.manager_adapter, "adapter_config.json"))
+    )
+    if cfg.full_parameter_rl and is_full_init:
+        manager_model = AutoModelForCausalLM.from_pretrained(
+            cfg.manager_adapter, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
-        print(f"[MANAGER_GRPO] manager init adapter -> {cfg.manager_adapter}")
+        print(f"[MANAGER_GRPO] full-parameter init model -> {cfg.manager_adapter}")
+    else:
+        manager_model = AutoModelForCausalLM.from_pretrained(
+            cfg.base_model, torch_dtype=dtype, trust_remote_code=True
+        ).to(device)
+        if cfg.manager_adapter:
+            if not PEFT_AVAILABLE:
+                raise RuntimeError("peft is required to load --mgr_init_adapter.")
+            manager_model = PeftModel.from_pretrained(
+                manager_model,
+                cfg.manager_adapter,
+                is_trainable=(not cfg.full_parameter_rl),
+            ).to(device)
+            if cfg.full_parameter_rl:
+                manager_model = manager_model.merge_and_unload().to(device)
+                print(f"[MANAGER_GRPO] merged init adapter for full-parameter RL -> {cfg.manager_adapter}")
+            else:
+                print(f"[MANAGER_GRPO] manager init adapter -> {cfg.manager_adapter}")
+    if cfg.full_parameter_rl:
+        for p in manager_model.parameters():
+            p.requires_grad_(True)
+        trainable = sum(p.numel() for p in manager_model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in manager_model.parameters())
+        print(f"[MANAGER_GRPO] full_parameter_rl=True trainable_params={trainable}/{total}")
     manager_model.config.use_cache = False
     if not hasattr(manager_model, "warnings_issued") or manager_model.warnings_issued is None:
         manager_model.warnings_issued = {}
@@ -381,6 +406,7 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         "n_train_rows": len(cfg.rows),
         "subagents": sorted(pool._agents.keys()),
         "manager_adapter": cfg.manager_adapter,
+        "full_parameter_rl": bool(cfg.full_parameter_rl),
         "routing_efficiency_bonus": cfg.routing_efficiency_bonus,
         "tool_use_bonus": cfg.tool_use_bonus,
     })

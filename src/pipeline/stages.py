@@ -524,7 +524,9 @@ def run_train_manager_grpo(
     grpo_beta: float = 0.01,
     routing_efficiency_bonus: float = 0.0,
     tool_use_bonus: float = 0.0,
+    full_parameter_rl: bool = False,
     max_steps: int = -1,
+    output_dir: Optional[str] = None,
     use_wandb: bool = False,
     wandb_project: str = "agent_routing",
     wandb_entity: str = "",
@@ -533,7 +535,7 @@ def run_train_manager_grpo(
 ) -> Dict[str, Any]:
     from ..manager.grpo_train import ManagerGRPOConfig, train_manager_grpo
 
-    out_dir = ctx.manager_grpo_dir()
+    out_dir = output_dir or ctx.manager_grpo_dir()
     cfg = ManagerGRPOConfig(
         base_model=ctx.base_model,
         rows=train_rows,
@@ -542,7 +544,7 @@ def run_train_manager_grpo(
         reasoner_adapter=reasoner_adapter or ctx.adapter_path("reasoner"),
         rule_applier_adapter=rule_applier_adapter or ctx.adapter_path("rule_applier"),
         manager_adapter=manager_adapter,
-        fail_buffer_jsonl=ctx.fail_buffer_path(),
+        fail_buffer_jsonl=os.path.join(out_dir, "fail_buffer.jsonl"),
         raw_trace_jsonl=os.path.join(out_dir, "train_raw_trace.jsonl"),
         seed=ctx.seed,
         per_device_train_batch_size=per_device_batch_size,
@@ -553,6 +555,7 @@ def run_train_manager_grpo(
         max_steps=max_steps,
         routing_efficiency_bonus=routing_efficiency_bonus,
         tool_use_bonus=tool_use_bonus,
+        full_parameter_rl=full_parameter_rl,
         binding_mode=ctx.binding_mode,
         use_wandb=use_wandb,
         wandb_project=wandb_project,
@@ -561,7 +564,7 @@ def run_train_manager_grpo(
         task_description=task_description,
     )
     train_manager_grpo(cfg)
-    return {"manager_dir": out_dir, "fail_buffer": ctx.fail_buffer_path()}
+    return {"manager_dir": out_dir, "fail_buffer": os.path.join(out_dir, "fail_buffer.jsonl")}
 
 
 # --------------------- Stage: evolve build SFT ---------------------
@@ -691,6 +694,7 @@ def run_evolve_round(
     sft_kwargs = sft_kwargs or {}
 
     grpo_res = run_train_manager_grpo(ctx=ctx, train_rows=train_rows, **grpo_kwargs)
+    evolve_kwargs.setdefault("fail_buffer_jsonl", grpo_res.get("fail_buffer"))
     evolve_res = run_evolve_build_sft(ctx=ctx, rows=full_rows, **evolve_kwargs)
     sft_res = run_train_manager_sft(ctx=ctx, **sft_kwargs)
     return {"grpo": grpo_res, "evolve": evolve_res, "manager_sft": sft_res}
@@ -899,4 +903,323 @@ def run_eval_manager(
     write_jsonl(os.path.join(ctx.eval_root, "manager_eval.jsonl"), rows_log)
     write_json(os.path.join(ctx.eval_root, "manager_eval_report.json"), report)
     print(f"[EVAL/MANAGER] teacher={ctx.teacher_id} acc={accuracy:.3f} (n={len(sample)})")
+    return report
+
+
+def _manager_tool_schemas(binding_mode: str) -> List[Dict[str, Any]]:
+    required = ["example_id"] if binding_mode == "argument" else []
+    properties = (
+        {
+            "example_id": {
+                "type": "integer",
+                "description": "The current example ID from the user message.",
+            }
+        }
+        if binding_mode == "argument"
+        else {}
+    )
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "extractor_tool",
+                "description": "Extract decision-relevant factual signals from the question and context.",
+                "parameters": {"type": "object", "properties": properties, "required": required},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reasoner_tool",
+                "description": "Produce a structured reasoning scaffold for the choices.",
+                "parameters": {"type": "object", "properties": properties, "required": required},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "rule_applier_tool",
+                "description": "Identify applicable rules or criteria and map facts to their elements.",
+                "parameters": {"type": "object", "properties": properties, "required": required},
+            },
+        },
+    ]
+
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_manager_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Parse Qwen-style XML tool calls emitted by the chat template."""
+    calls: List[Dict[str, Any]] = []
+    for m in _TOOL_CALL_RE.finditer(text or ""):
+        try:
+            obj = json.loads(m.group(1))
+        except Exception:
+            continue
+        name = str(obj.get("name") or "").strip()
+        args = obj.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        if name:
+            calls.append({"name": name, "arguments": args if isinstance(args, dict) else {}})
+    content = _TOOL_CALL_RE.sub("", text or "").strip()
+    return content, calls
+
+
+def _tool_call_message(tool_name: str, args: Dict[str, Any], call_id: str) -> Dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        }],
+    }
+
+
+def _load_manager_for_eval(ctx: StageContext, manager_dir: str, device: str, dtype: Any):
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(manager_dir, trust_remote_code=True)
+    if tok.pad_token_id is None and tok.eos_token_id is not None:
+        tok.pad_token_id = tok.eos_token_id
+    tok.padding_side = "left"
+
+    is_full = (
+        os.path.exists(os.path.join(manager_dir, "config.json"))
+        and not os.path.exists(os.path.join(manager_dir, "adapter_config.json"))
+    )
+    if is_full:
+        model = AutoModelForCausalLM.from_pretrained(
+            manager_dir, torch_dtype=dtype, trust_remote_code=True
+        ).to(device)
+    else:
+        from peft import PeftModel
+        base = AutoModelForCausalLM.from_pretrained(
+            ctx.base_model, torch_dtype=dtype, trust_remote_code=True
+        ).to(device)
+        model = PeftModel.from_pretrained(base, manager_dir).to(device)
+    model.eval()
+    return tok, model
+
+
+def _render_manager_chat(tok: Any, messages: List[Dict[str, Any]],
+                         tools: List[Dict[str, Any]]) -> str:
+    try:
+        return tok.apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tok.apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+
+def run_eval_manager_tools(
+    ctx: StageContext,
+    rows: List[StandardRow],
+    manager_dir: Optional[str] = None,
+    n_samples: int = 100,
+    temperature: float = 0.0,
+    max_new_tokens: int = 1024,
+    max_tool_calls: int = 3,
+    task_description: str = "",
+) -> Dict[str, Any]:
+    """Evaluate the manager with the same frozen subagents used as tools."""
+    import torch
+    from ..subagents.runtime import FrozenSubagent, SubagentPool
+
+    if manager_dir is None:
+        manager_dir = ctx.manager_grpo_dir()
+    if not os.path.exists(manager_dir):
+        raise FileNotFoundError(f"manager_dir not found: {manager_dir}")
+
+    binding_mode = ctx.binding_mode
+    if binding_mode == "auto":
+        run_config = os.path.join(manager_dir, "manager_run_config.json")
+        if os.path.exists(run_config):
+            try:
+                with open(run_config, "r", encoding="utf-8") as f:
+                    binding_mode = str(json.load(f).get("binding_mode") or "argument")
+            except Exception:
+                binding_mode = "argument"
+        else:
+            binding_mode = "argument"
+    if binding_mode == "environment":
+        # The local XML tool loop is equivalent to argument binding except the
+        # example ID is injected by the evaluator instead of generated by model.
+        user_binding_mode = "environment"
+    else:
+        user_binding_mode = "argument"
+
+    set_seed(ctx.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+    pool = SubagentPool()
+    for kind in ("extractor", "reasoner", "rule_applier"):
+        adapter = ctx.adapter_path(kind)
+        if os.path.exists(adapter):
+            pool.register(FrozenSubagent(ctx.base_model, adapter, kind, device))
+    if not pool._agents:
+        raise FileNotFoundError(f"No subagent adapters found under {ctx.adapter_root}")
+
+    tok, model = _load_manager_for_eval(ctx, manager_dir, device, dtype)
+    tools = _manager_tool_schemas(user_binding_mode)
+
+    sample = list(rows)
+    random.Random(ctx.seed).shuffle(sample)
+    sample = sample[:n_samples]
+
+    rows_log: List[Dict[str, Any]] = []
+    n_correct = 0
+    n_valid = 0
+    total_tool_calls = 0
+    tool_counts: Dict[str, int] = {}
+    malformed_tool_calls = 0
+
+    for r in sample:
+        messages: List[Dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": build_manager_system_prompt(
+                    label_keys=list(r.choices.keys()),
+                    task_description=task_description,
+                ),
+            },
+            {
+                "role": "user",
+                "content": build_manager_user_message(
+                    example_id=r.example_id,
+                    question=r.question,
+                    context=r.context,
+                    choices=r.choices,
+                    binding_mode=user_binding_mode,
+                ),
+            },
+        ]
+        trajectory: List[Dict[str, Any]] = []
+        used_tools: List[str] = []
+        final_text = ""
+
+        for step in range(max(1, max_tool_calls + 1)):
+            prompt_text = _render_manager_chat(tok, messages, tools)
+            inputs = tok(prompt_text, return_tensors="pt").to(device)
+            do_sample = temperature > 1e-6
+            gen = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                pad_token_id=tok.pad_token_id,
+                eos_token_id=tok.eos_token_id,
+                **({"temperature": max(temperature, 1e-6)} if do_sample else {}),
+            )
+            out = tok.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+            content, calls = _extract_manager_tool_calls(out)
+            final_text = content or out
+
+            if not calls or len(used_tools) >= max_tool_calls:
+                messages.append({"role": "assistant", "content": final_text})
+                trajectory.append({"role": "assistant", "content": final_text[:2000], "tool_calls": []})
+                break
+
+            call = calls[0]
+            tool_name = call["name"]
+            args = dict(call.get("arguments") or {})
+            if user_binding_mode == "environment" or "example_id" not in args:
+                args["example_id"] = int(r.example_id)
+
+            call_id = f"eval_{int(r.example_id)}_{len(used_tools)}"
+            messages.append(_tool_call_message(tool_name, args, call_id))
+            used_tools.append(tool_name)
+            tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
+
+            tool_kind = tool_name[:-5] if tool_name.endswith("_tool") else tool_name
+            try:
+                tool_output = pool.call(
+                    agent_kind=tool_kind,
+                    example_id=int(args.get("example_id", r.example_id)),
+                    question=r.question,
+                    context=r.context,
+                    choices=r.choices,
+                    cache_namespace="eval_manager_tools",
+                )
+            except Exception as e:
+                malformed_tool_calls += 1
+                tool_output = json.dumps({"error": str(e)}, ensure_ascii=False)
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": tool_name,
+                "content": tool_output,
+            })
+            trajectory.append({
+                "role": "assistant",
+                "content": content[:1000],
+                "tool_call": {"name": tool_name, "arguments": args},
+            })
+            trajectory.append({
+                "role": "tool",
+                "name": tool_name,
+                "content": tool_output[:2000],
+            })
+
+        pred = parse_final_answer(final_text, list(r.choices.keys()))
+        correct = bool(pred is not None and pred == r.ground_truth)
+        if pred is not None:
+            n_valid += 1
+        if correct:
+            n_correct += 1
+        total_tool_calls += len(used_tools)
+        rows_log.append({
+            "example_id": r.example_id,
+            "benchmark_name": r.benchmark_name,
+            "task_subtype": r.task_subtype,
+            "ground_truth": r.ground_truth,
+            "pred": pred,
+            "correct": correct,
+            "valid_answer": pred is not None,
+            "tool_calls": len(used_tools),
+            "tool_names_called": used_tools,
+            "final_text": final_text[:2000],
+            "trajectory": trajectory,
+        })
+
+    n = len(sample)
+    report = {
+        "teacher_id": ctx.teacher_id,
+        "manager_dir": manager_dir,
+        "n_samples": n,
+        "accuracy": n_correct / max(1, n),
+        "valid_answer_rate": n_valid / max(1, n),
+        "tool_call_rate": sum(1 for r in rows_log if r["tool_calls"] > 0) / max(1, n),
+        "avg_tool_calls": total_tool_calls / max(1, n),
+        "tool_counts": tool_counts,
+        "malformed_tool_calls": malformed_tool_calls,
+        "binding_mode": binding_mode,
+        "subagents": sorted(pool._agents.keys()),
+    }
+    write_jsonl(os.path.join(ctx.eval_root, "manager_tool_eval.jsonl"), rows_log)
+    write_json(os.path.join(ctx.eval_root, "manager_tool_eval_report.json"), report)
+    print(
+        f"[EVAL/MANAGER_TOOLS] teacher={ctx.teacher_id} "
+        f"acc={report['accuracy']:.3f} tool_rate={report['tool_call_rate']:.3f} (n={n})"
+    )
     return report
