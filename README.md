@@ -491,22 +491,56 @@ This is different from `manager_coldstart_sft`:
 
 ## Evaluation
 
-Subagent schema eval:
+Evaluation now has two different manager paths:
+
+- `eval_manager_tools`: recommended. This evaluates the trained manager with
+  frozen subagents in the loop, using the same tool names as GRPO
+  (`extractor_tool`, `reasoner_tool`, `rule_applier_tool`). Use this for final
+  accuracy and routing/tool-use metrics.
+- `eval_manager`: legacy sanity probe. This does one-shot manager generation
+  without executing tools, so it does not measure the routed manager system.
+
+MedQA leakage rule: keep evaluation on the MedQA `test` split. The normalized
+cache already contains explicit `train` / `dev` / `test` splits; the CLI honors
+those splits. Use `--test_size 1270 --eval_n_samples 1270` to evaluate the full
+MedQA test split instead of the default 200-example cap. Subagent SFT rows and
+manager GRPO rows come from `train`, so they should not appear in this test
+evaluation.
+
+Subagent schema eval checks whether each frozen subagent emits valid outputs:
 
 ```powershell
 python -X utf8 -m src.pipeline.cli eval_subagents --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --eval_n_samples 50
 ```
 
-Manager eval:
-
-```powershell
-python -X utf8 -m src.pipeline.cli eval_manager --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --eval_n_samples 200
-```
-
-Manager eval with frozen subagents as tools:
+Recommended MedQA manager evaluation after full-parameter GRPO:
 
 ```powershell
 python -X utf8 -m src.pipeline.cli eval_manager_tools --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --eval_n_samples 1270 --test_size 1270 --eval_manager_dir outputs\manager\openai_us4_500_runtime_raw\grpo_full --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+```
+
+Outputs:
+
+```text
+outputs/eval/openai_us4_500_runtime_raw/manager_tool_eval.jsonl
+outputs/eval/openai_us4_500_runtime_raw/manager_tool_eval_report.json
+```
+
+Key report fields:
+
+```text
+accuracy
+valid_answer_rate
+tool_call_rate
+avg_tool_calls
+tool_counts
+malformed_tool_calls
+```
+
+Use this small smoke test before the full 1270-example run:
+
+```powershell
+python -X utf8 -m src.pipeline.cli eval_manager_tools --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --eval_n_samples 20 --test_size 1270 --eval_manager_dir outputs\manager\openai_us4_500_runtime_raw\grpo_full --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
 ```
 
 LegalBench manager tool eval:
@@ -515,12 +549,16 @@ LegalBench manager tool eval:
 python -X utf8 -m src.pipeline.cli eval_manager_tools --teacher_id openai_us4_500_runtime_raw --legalbench_normalized_cache outputs\data\legalbench_abercrombie.jsonl --eval_n_samples 200 --eval_manager_dir outputs\manager\openai_us4_500_runtime_raw\grpo_full --task_description "You are a manager agent solving a LegalBench multiple-choice classification task."
 ```
 
-Note: `eval_manager` is simple generation without tool execution.
-Use `eval_manager_tools` for accuracy with frozen subagents in the loop, and
-use GRPO traces for training-time tool-call behavior analysis:
+Legacy one-shot manager probe, without tool execution:
+
+```powershell
+python -X utf8 -m src.pipeline.cli eval_manager --teacher_id openai_us4_500_runtime_raw --medqa_normalized_cache outputs\data\medqa_us4_normalized.jsonl --eval_n_samples 200 --eval_manager_dir outputs\manager\openai_us4_500_runtime_raw\grpo_full --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+```
+
+For training-time rollout behavior, inspect the raw GRPO trace from the run:
 
 ```text
-outputs/manager/<teacher_id>/grpo/train_raw_trace.jsonl
+outputs/manager/<teacher_id>/grpo_full/train_raw_trace.jsonl
 ```
 
 ---
