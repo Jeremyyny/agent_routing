@@ -563,6 +563,81 @@ outputs/manager/<teacher_id>/grpo_full/train_raw_trace.jsonl
 
 ---
 
+## LegalBench Five-Task Flow
+
+The current manager/subagent framework is best suited to LegalBench subtasks
+that are text classification problems with a small fixed label set. A practical
+five-task set is:
+
+```text
+abercrombie,hearsay,personal_jurisdiction,proa,successor_liability
+```
+
+These configs load cleanly with `--legalbench_max_labels 12` and produce 381
+total rows. Because LegalBench train splits are few-shot demonstrations, this
+pipeline creates a deterministic train/dev/test split from the loaded rows.
+With the default split caps, the five-task cache gives roughly:
+
+```text
+train/dev/test = 215/71/95
+```
+
+To avoid contamination:
+
+- Generate subagent SFT from only the derived train split.
+- Exclude those subagent SFT `example_id`s from manager cold-start and GRPO.
+- Evaluate only on the derived test split.
+
+Suggested `teacher_id`:
+
+```text
+legalbench_5tasks
+```
+
+Build subagent SFT rows online with OpenAI. Use 100 train examples per subagent
+so manager training still has held-out train rows after exclusions:
+
+```powershell
+python -X utf8 -m src.pipeline.cli synth_subagent --teacher_id legalbench_5tasks --teacher_provider openai --teacher_model gpt-4o-mini --agent_kind extractor --legalbench_configs "abercrombie,hearsay,personal_jurisdiction,proa,successor_liability" --legalbench_normalized_cache outputs\data\legalbench_5tasks.jsonl --legalbench_refresh_cache --n_samples 100 --task_description "You are a manager agent solving LegalBench multiple-choice legal classification tasks."
+python -X utf8 -m src.pipeline.cli synth_subagent --teacher_id legalbench_5tasks --teacher_provider openai --teacher_model gpt-4o-mini --agent_kind reasoner --legalbench_configs "abercrombie,hearsay,personal_jurisdiction,proa,successor_liability" --legalbench_normalized_cache outputs\data\legalbench_5tasks.jsonl --n_samples 100 --task_description "You are a manager agent solving LegalBench multiple-choice legal classification tasks."
+python -X utf8 -m src.pipeline.cli synth_subagent --teacher_id legalbench_5tasks --teacher_provider openai --teacher_model gpt-4o-mini --agent_kind rule_applier --legalbench_configs "abercrombie,hearsay,personal_jurisdiction,proa,successor_liability" --legalbench_normalized_cache outputs\data\legalbench_5tasks.jsonl --n_samples 100 --task_description "You are a manager agent solving LegalBench multiple-choice legal classification tasks."
+```
+
+Train the three LegalBench subagents:
+
+```powershell
+python -X utf8 -m src.pipeline.cli train_subagent --teacher_id legalbench_5tasks --agent_kind extractor --sft_epochs 3 --sft_lr 2e-4
+python -X utf8 -m src.pipeline.cli train_subagent --teacher_id legalbench_5tasks --agent_kind reasoner --sft_epochs 3 --sft_lr 2e-4
+python -X utf8 -m src.pipeline.cli train_subagent --teacher_id legalbench_5tasks --agent_kind rule_applier --sft_epochs 3 --sft_lr 2e-4
+```
+
+Build and train manager cold-start SFT on LegalBench train rows not used for
+subagent SFT:
+
+```powershell
+python -X utf8 -m src.pipeline.cli manager_coldstart_sft --teacher_id legalbench_5tasks --legalbench_configs "abercrombie,hearsay,personal_jurisdiction,proa,successor_liability" --legalbench_normalized_cache outputs\data\legalbench_5tasks.jsonl --exclude_sft_example_ids outputs\sft_data\legalbench_5tasks\extractor_sft.jsonl --exclude_sft_example_ids outputs\sft_data\legalbench_5tasks\reasoner_sft.jsonl --exclude_sft_example_ids outputs\sft_data\legalbench_5tasks\rule_applier_sft.jsonl --coldstart_n_samples 60 --task_description "You are a manager agent solving LegalBench multiple-choice legal classification tasks."
+python -X utf8 -m src.pipeline.cli train_manager_sft --teacher_id legalbench_5tasks --manager_sft_train_jsonl outputs\manager\legalbench_5tasks\evolve\manager_sft_coldstart.jsonl --manager_sft_epochs 1 --manager_sft_lr 2e-5
+```
+
+Run full-parameter GRPO on the remaining LegalBench train rows:
+
+```powershell
+python -X utf8 -m src.pipeline.cli train_manager_grpo --teacher_id legalbench_5tasks --legalbench_configs "abercrombie,hearsay,personal_jurisdiction,proa,successor_liability" --legalbench_normalized_cache outputs\data\legalbench_5tasks.jsonl --exclude_sft_example_ids outputs\sft_data\legalbench_5tasks\extractor_sft.jsonl --exclude_sft_example_ids outputs\sft_data\legalbench_5tasks\reasoner_sft.jsonl --exclude_sft_example_ids outputs\sft_data\legalbench_5tasks\rule_applier_sft.jsonl --mgr_init_adapter outputs\manager\legalbench_5tasks\sft_evolved --mgr_full_parameter_rl --mgr_output_dir outputs\manager\legalbench_5tasks\grpo_full --mgr_bs 2 --mgr_num_generations 2 --mgr_max_completion_length 2048 --mgr_temperature 1.0 --mgr_grpo_beta 0.01 --mgr_tool_use_bonus 0.2 --mgr_max_steps 50 --task_description "You are a manager agent solving LegalBench multiple-choice legal classification tasks."
+```
+
+Evaluate on the held-out LegalBench test split:
+
+```powershell
+python -X utf8 -m src.pipeline.cli eval_manager_tools --teacher_id legalbench_5tasks --legalbench_configs "abercrombie,hearsay,personal_jurisdiction,proa,successor_liability" --legalbench_normalized_cache outputs\data\legalbench_5tasks.jsonl --eval_n_samples 95 --test_size 95 --eval_manager_dir outputs\manager\legalbench_5tasks\grpo_full --task_description "You are a manager agent solving LegalBench multiple-choice legal classification tasks."
+```
+
+Outputs:
+
+```text
+outputs/eval/legalbench_5tasks/manager_tool_eval.jsonl
+outputs/eval/legalbench_5tasks/manager_tool_eval_report.json
+```
+
 ## CLI Stages
 
 | Stage | Purpose |

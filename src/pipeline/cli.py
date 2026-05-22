@@ -222,18 +222,32 @@ def _load_legalbench_or_cache(args) -> List[StandardRow]:
     return rows
 
 
-def _load_eval_rows(args) -> List[StandardRow]:
-    """Load the benchmark requested for evaluation.
+def _using_legalbench(args) -> bool:
+    return bool(args.legalbench_normalized_cache or args.legalbench_configs)
 
-    LegalBench is selected when an explicit LegalBench cache/config is passed;
-    otherwise we preserve the existing MedQA default.
+
+def _load_benchmark_splits(args) -> dict:
+    """Load the requested benchmark and return train/dev/test splits.
+
+    MedQA has native train/dev/test splits. LegalBench configs usually expose
+    few-shot train rows plus test rows, so for this pipeline we create a
+    deterministic split from the loaded LegalBench rows. This keeps subagent
+    SFT, manager GRPO, and evaluation disjoint.
     """
-    if args.legalbench_normalized_cache or args.legalbench_configs:
+    if _using_legalbench(args):
         rows = _load_legalbench_or_cache(args)
-        preferred = [r for r in rows if (r.split or "").lower() in {"test", "dev", "validation"}]
-        return preferred or rows
+        train, dev, test = stages._split_rows(
+            rows=rows, train_size=args.train_size, dev_size=args.dev_size,
+            test_size=args.test_size, seed=args.seed,
+        )
+        print(f"[SPLIT/LEGALBENCH] train/dev/test = {len(train)}/{len(dev)}/{len(test)}")
+        return {"all": rows, "train": train, "dev": dev, "test": test}
 
-    data = _load_or_split(args)
+    return _load_or_split(args)
+
+
+def _load_eval_rows(args) -> List[StandardRow]:
+    data = _load_benchmark_splits(args)
     return data["test"] or data["dev"]
 
 
@@ -272,7 +286,8 @@ def main() -> None:
             sys.exit("export_legalbench_jsonl requires --agent_kind")
         if not args.legalbench_configs:
             sys.exit("export_legalbench_jsonl requires --legalbench_configs")
-        rows = _load_legalbench_or_cache(args)
+        data = _load_benchmark_splits(args)
+        rows = data["train"]
         if not rows:
             sys.exit("No LegalBench rows loaded. Check configs/split/max_labels.")
         out_path = args.deepseek_prompt_jsonl or os.path.join(
@@ -292,7 +307,7 @@ def main() -> None:
     if args.stage == "synth_subagent":
         if not (args.teacher_provider and args.teacher_model and args.agent_kind):
             sys.exit("synth_subagent requires --teacher_provider, --teacher_model, --agent_kind")
-        data = _load_or_split(args)
+        data = _load_benchmark_splits(args)
         kind = args.agent_kind
         # Synthesize on the train pool
         result = stages.run_synthesize_subagent(
@@ -309,7 +324,7 @@ def main() -> None:
     if args.stage == "export_deepseek_jsonl":
         if not args.agent_kind:
             sys.exit("export_deepseek_jsonl requires --agent_kind")
-        data = _load_or_split(args)
+        data = _load_benchmark_splits(args)
         kind = args.agent_kind
         result = stages.run_export_deepseek_subagent_prompts(
             ctx=ctx,
@@ -358,7 +373,7 @@ def main() -> None:
         return
 
     if args.stage == "train_manager_grpo":
-        data = _load_or_split(args)
+        data = _load_benchmark_splits(args)
         train_rows = _exclude_sft_rows(data["train"], args.exclude_sft_example_ids)
         result = stages.run_train_manager_grpo(
             ctx=ctx, train_rows=train_rows,
@@ -383,7 +398,7 @@ def main() -> None:
         return
 
     if args.stage == "evolve_build_sft":
-        data = _load_or_split(args)
+        data = _load_benchmark_splits(args)
         result = stages.run_evolve_build_sft(
             ctx=ctx, rows=data["all"],
             teacher_provider=(args.teacher_provider or None),
@@ -396,7 +411,7 @@ def main() -> None:
         return
 
     if args.stage == "manager_coldstart_sft":
-        data = _load_or_split(args)
+        data = _load_benchmark_splits(args)
         train_rows = _exclude_sft_rows(data["train"], args.exclude_sft_example_ids)
         result = stages.run_manager_coldstart_sft(
             ctx=ctx,
@@ -425,7 +440,7 @@ def main() -> None:
         return
 
     if args.stage == "evolve_round":
-        data = _load_or_split(args)
+        data = _load_benchmark_splits(args)
         train_rows = _exclude_sft_rows(data["train"], args.exclude_sft_example_ids)
         grpo_kwargs = dict(
             manager_adapter=(args.mgr_init_adapter or None),
@@ -468,7 +483,7 @@ def main() -> None:
         return
 
     if args.stage == "eval_subagents":
-        data = _load_or_split(args)
+        data = _load_benchmark_splits(args)
         kinds = [k.strip() for k in args.eval_kinds.split(",") if k.strip()]
         result = stages.run_eval_subagents(
             ctx=ctx, rows=data["dev"] or data["test"], agent_kinds=kinds,
