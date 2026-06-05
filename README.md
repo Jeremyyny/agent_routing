@@ -200,66 +200,244 @@ to adjust `num_processes` or enable offload if needed.
 
 ---
 
-## End-to-end on MedQA (single teacher)
+## End-to-end on MedQA (full-parameter GRPO, 4× GPU)
 
-Each command writes under `outputs/<thing>/<teacher_slug>/`, so artifacts from different teachers never collide.
+Complete pipeline: subagent SFT → cold-start → full-param GRPO → eval.
+Replace the env vars at the top and every command below will work as-is.
 
 ```bash
-TEACHER_ID=claude_sonnet_4_5
-PROVIDER=anthropic
-MODEL=claude-sonnet-4-5
+# ── configure once ────────────────────────────────────────────────────────────
+export TEACHER_ID=claude_sonnet_4_5       # controls all output paths
+export PROVIDER=anthropic                 # anthropic | openai | deepseek
+export MODEL=claude-sonnet-4-5
+export BASE_MODEL=Qwen/Qwen3-8B
+export TASK_DESC="You are a manager agent solving USMLE-style medical multiple-choice questions."
+export PYTHONUTF8=1
+# ─────────────────────────────────────────────────────────────────────────────
 
-# 1. Cache MedQA from HF + decide splits (idempotent — re-running is free)
+# ── Step 1: cache MedQA from HuggingFace (idempotent) ─────────────────────────
 python -m src.pipeline.cli load_medqa \
-    --train_size 600 --dev_size 100 --test_size 200
+    --base_model "$BASE_MODEL" \
+    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
+    --train_size 1200 --dev_size 200 --test_size 1270
 
-# 2. Synthesize 500 SFT samples per subagent
+# ── Step 2: synthesize subagent SFT data (500 samples each) ──────────────────
 for KIND in extractor reasoner rule_applier; do
   python -m src.pipeline.cli synth_subagent \
+      --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" \
       --teacher_provider "$PROVIDER" --teacher_model "$MODEL" \
-      --agent_kind "$KIND" --n_samples 500
+      --agent_kind "$KIND" --n_samples 500 \
+      --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
+      --train_size 1200 --test_size 1270 \
+      --task_description "$TASK_DESC"
 done
 
-# 3. SFT-train each subagent (LoRA r=16, alpha=32)
+# ── Step 3: SFT-train the three subagents ────────────────────────────────────
 for KIND in extractor reasoner rule_applier; do
   python -m src.pipeline.cli train_subagent \
+      --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" --agent_kind "$KIND" \
       --sft_epochs 3 --sft_lr 2e-4
 done
 
-# 4. (recommended) Validate that subagents output valid JSON / pass schema
+# ── Step 4: validate subagents (recommended before manager training) ──────────
 python -m src.pipeline.cli eval_subagents \
-    --teacher_id "$TEACHER_ID" --eval_n_samples 50
-
-# 5. Train the manager with GRPO (binary correctness reward)
-python -m src.pipeline.cli train_manager_grpo \
+    --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
+    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
+    --eval_n_samples 50
+
+# Check: json_ok_rate and schema_ok_rate should both be > 0.9 for each subagent.
+# If they're low, run more SFT epochs or increase --n_samples.
+
+# ── Step 5: build manager cold-start SFT ─────────────────────────────────────
+# Without this, the manager won't discover tool calls during GRPO
+# (tools/call_frequency will stay at 0).
+python -m src.pipeline.cli manager_coldstart_sft \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
+    --train_size 1200 --test_size 1270 \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --coldstart_n_samples 300 \
+    --task_description "$TASK_DESC"
+
+# ── Step 6: SFT-train manager on cold-start demonstrations ───────────────────
+python -m src.pipeline.cli train_manager_sft \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --manager_sft_train_jsonl "outputs/manager/${TEACHER_ID}/evolve/manager_sft_coldstart.jsonl" \
+    --manager_sft_epochs 1 --manager_sft_lr 2e-5
+
+# ── Step 7: full-parameter GRPO on 4 GPUs ────────────────────────────────────
+# Terminal A — start vLLM subagent server on GPU 0 (keep it running):
+#   conda activate vllm_env
+#   bash scripts/start_subagent_server.sh "$BASE_MODEL" "$TEACHER_ID"
+
+# Terminal B — run GRPO training on GPUs 1-2-3:
+bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
+    --base_model "$BASE_MODEL" \
+    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
+    --train_size 1200 --test_size 1270 \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_evolved" \
+    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_full" \
+    --mgr_bs 2 --mgr_num_generations 2 \
     --mgr_max_steps 200 \
-    --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+    --mgr_use_wandb --wandb_project agent_routing \
+    --wandb_run_name "${TEACHER_ID}_grpo_full" \
+    --task_description "$TASK_DESC"
 
-# 6. One evolve round: GRPO failures -> teacher routing plan -> manager SFT
-python -m src.pipeline.cli evolve_round \
+# ── Step 8: evaluate manager with subagents in the loop ───────────────────────
+python -m src.pipeline.cli eval_manager_tools \
+    --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
-    --teacher_provider "$PROVIDER" --teacher_model "$MODEL" \
-    --mgr_max_steps 100
+    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
+    --eval_n_samples 1270 --test_size 1270 \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_full" \
+    --task_description "$TASK_DESC"
 
-# 7. Evaluate the final manager on the test split
-python -m src.pipeline.cli eval_manager \
-    --teacher_id "$TEACHER_ID" --eval_n_samples 200
+# Results:
+#   outputs/eval/$TEACHER_ID/manager_tool_eval_report.json  ← accuracy, tool_call_rate
+#   outputs/eval/$TEACHER_ID/manager_tool_eval.jsonl        ← per-example detail
 ```
 
-A full single-teacher run on Qwen3-0.6B with one A100 takes roughly:
+---
 
-| Stage                    | Time          | Cost (teacher) |
-|--------------------------|---------------|----------------|
-| Synth (3 × 500 samples)  | 30–90 min     | $5–$30         |
-| Subagent SFT (×3)        | 10–20 min     | —              |
-| Manager GRPO (200 steps) | 1–3 hours     | —              |
-| Evolve round             | 30–60 min     | $1–$5          |
-| Eval                     | 5–10 min      | —              |
+## End-to-end on LegalBench (full-parameter GRPO, 4× GPU)
 
-Teacher cost varies a lot by provider — DeepSeek is the cheapest by ~10×, Claude/GPT comparable.
+Same pipeline, different benchmark. Uses 5 LegalBench subtasks that have
+a small fixed label set and load cleanly together.
+
+```bash
+# ── configure once ────────────────────────────────────────────────────────────
+export TEACHER_ID=legalbench_claude
+export PROVIDER=anthropic
+export MODEL=claude-sonnet-4-5
+export BASE_MODEL=Qwen/Qwen3-8B
+export LB_CONFIGS="abercrombie,hearsay,personal_jurisdiction,proa,successor_liability"
+export TASK_DESC="You are a manager agent solving LegalBench multiple-choice legal classification tasks."
+export PYTHONUTF8=1
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Step 1: cache LegalBench (idempotent) ─────────────────────────────────────
+python -m src.pipeline.cli load_medqa \
+    --base_model "$BASE_MODEL"
+# Note: LegalBench rows are loaded on-demand by later stages via --legalbench_configs.
+# No separate load_legalbench command needed; the first synth_subagent call caches them.
+
+# ── Step 2: synthesize subagent SFT data ─────────────────────────────────────
+# Use 100 samples per subagent so manager training still has held-out train rows.
+for KIND in extractor reasoner rule_applier; do
+  python -m src.pipeline.cli synth_subagent \
+      --base_model "$BASE_MODEL" \
+      --teacher_id "$TEACHER_ID" \
+      --teacher_provider "$PROVIDER" --teacher_model "$MODEL" \
+      --agent_kind "$KIND" --n_samples 100 \
+      --legalbench_configs "$LB_CONFIGS" \
+      --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
+      --legalbench_refresh_cache \
+      --train_size 215 --test_size 95 \
+      --task_description "$TASK_DESC"
+done
+# On subsequent runs, drop --legalbench_refresh_cache to reuse the cached rows.
+
+# ── Step 3: SFT-train the three subagents ────────────────────────────────────
+for KIND in extractor reasoner rule_applier; do
+  python -m src.pipeline.cli train_subagent \
+      --base_model "$BASE_MODEL" \
+      --teacher_id "$TEACHER_ID" --agent_kind "$KIND" \
+      --sft_epochs 3 --sft_lr 2e-4
+done
+
+# ── Step 4: validate subagents ────────────────────────────────────────────────
+python -m src.pipeline.cli eval_subagents \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --legalbench_configs "$LB_CONFIGS" \
+    --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
+    --eval_n_samples 50
+
+# ── Step 5: cold-start manager ────────────────────────────────────────────────
+python -m src.pipeline.cli manager_coldstart_sft \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --legalbench_configs "$LB_CONFIGS" \
+    --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
+    --train_size 215 --test_size 95 \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --coldstart_n_samples 60 \
+    --task_description "$TASK_DESC"
+
+# ── Step 6: SFT-train manager on cold-start demonstrations ───────────────────
+python -m src.pipeline.cli train_manager_sft \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --manager_sft_train_jsonl "outputs/manager/${TEACHER_ID}/evolve/manager_sft_coldstart.jsonl" \
+    --manager_sft_epochs 1 --manager_sft_lr 2e-5
+
+# ── Step 7: full-parameter GRPO on 4 GPUs ────────────────────────────────────
+# Terminal A — vLLM subagent server on GPU 0:
+#   conda activate vllm_env
+#   bash scripts/start_subagent_server.sh "$BASE_MODEL" "$TEACHER_ID"
+
+# Terminal B — GRPO training on GPUs 1-2-3:
+bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
+    --base_model "$BASE_MODEL" \
+    --legalbench_configs "$LB_CONFIGS" \
+    --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
+    --train_size 215 --test_size 95 \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_evolved" \
+    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_full" \
+    --mgr_bs 2 --mgr_num_generations 2 \
+    --mgr_max_steps 50 \
+    --mgr_use_wandb --wandb_project agent_routing \
+    --wandb_run_name "${TEACHER_ID}_grpo_full" \
+    --task_description "$TASK_DESC"
+
+# ── Step 8: evaluate on the held-out LegalBench test split ───────────────────
+python -m src.pipeline.cli eval_manager_tools \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --legalbench_configs "$LB_CONFIGS" \
+    --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
+    --eval_n_samples 95 --test_size 95 \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_full" \
+    --task_description "$TASK_DESC"
+
+# Results:
+#   outputs/eval/$TEACHER_ID/manager_tool_eval_report.json
+#   outputs/eval/$TEACHER_ID/manager_tool_eval.jsonl
+```
+
+---
+
+## Notes on the cold-start step
+
+Cold-start (steps 5–6) is critical for full-parameter GRPO. Without it the manager
+never discovers native tool calls and GRPO only trains direct-answer behavior:
+
+```
+tools/call_frequency: 0
+reward: 0
+frac_reward_zero_std: 1
+```
+
+If you see those metrics after starting GRPO, the cold-start adapter was not
+loaded. Verify `--mgr_init_adapter` points to a directory containing
+`adapter_config.json` or a full model `config.json`.
+
+---
 
 ---
 
