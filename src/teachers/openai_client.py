@@ -31,6 +31,7 @@ class OpenAITeacherClient(TeacherClient):
         if base_url:
             kwargs["base_url"] = base_url
         self._client = OpenAI(**kwargs)
+        self._use_max_completion_tokens = False
 
     def chat(
         self,
@@ -41,12 +42,26 @@ class OpenAITeacherClient(TeacherClient):
         last_err: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
-                resp = self._client.chat.completions.create(
+                kwargs = dict(
                     model=self.model,
                     messages=messages,
                     temperature=float(temperature),
-                    max_tokens=int(max_tokens),
                 )
+                if self._use_max_completion_tokens:
+                    kwargs["max_completion_tokens"] = int(max_tokens)
+                else:
+                    kwargs["max_tokens"] = int(max_tokens)
+                try:
+                    resp = self._client.chat.completions.create(**kwargs)
+                except Exception as e:
+                    msg = str(e)
+                    if "max_tokens" in msg and "max_completion_tokens" in msg:
+                        kwargs.pop("max_tokens", None)
+                        kwargs["max_completion_tokens"] = int(max_tokens)
+                        self._use_max_completion_tokens = True
+                        resp = self._client.chat.completions.create(**kwargs)
+                    else:
+                        raise
                 text = (resp.choices[0].message.content or "").strip()
                 return TeacherResponse(
                     text=text, provider=self.provider, model=self.model,

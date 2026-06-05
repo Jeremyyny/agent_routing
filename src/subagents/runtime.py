@@ -12,6 +12,10 @@ Key behaviors:
     GRPO group-relative advantage computation).
   - Caches outputs by (agent_kind, example_id) so repeated calls on the same
     example during multi-rollout GRPO are free.
+
+For multi-GPU full-parameter GRPO, use RemoteSubagentPool instead of SubagentPool.
+RemoteSubagentPool calls subagents via a vLLM HTTP server running on a dedicated GPU,
+so no subagent weights are loaded into the training processes.
 """
 from __future__ import annotations
 
@@ -19,6 +23,12 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+try:
+    import requests as _requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -169,6 +179,97 @@ class SubagentPool:
             raise KeyError(f"Subagent not registered: {agent_kind}")
 
         text = self._agents[agent_kind].generate(question, context, choices)
+        self._cache[key] = text
+        self._call_log.append({
+            "ts": int(time.time()),
+            "agent_kind": agent_kind,
+            "example_id": int(example_id),
+            "cache_hit": False,
+            "output_len": len(text),
+        })
+        return text
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+
+    def drain_log(self) -> List[Dict[str, Any]]:
+        log = self._call_log
+        self._call_log = []
+        return log
+
+
+class RemoteSubagentPool:
+    """Calls subagents via a vLLM HTTP server instead of loading models locally.
+
+    Drop-in replacement for SubagentPool for multi-GPU full-parameter GRPO.
+    Subagents run on a dedicated GPU (GPU 0) via vLLM with --enable-lora;
+    the adapter name is used as the model identifier in the OpenAI-compatible API.
+
+    Usage:
+        pool = RemoteSubagentPool("http://localhost:8000")
+        text = pool.call("extractor", example_id=42, question=..., context=..., choices=...)
+    """
+
+    def __init__(
+        self,
+        server_url: str,
+        registered_kinds: Optional[List[str]] = None,
+        max_new_tokens: int = 1024,
+        timeout: int = 120,
+    ) -> None:
+        if not REQUESTS_AVAILABLE:
+            raise RuntimeError(
+                "requests is required for RemoteSubagentPool. pip install requests"
+            )
+        self._server_url = server_url.rstrip("/")
+        self._kinds: set = set(registered_kinds or ["extractor", "reasoner", "rule_applier"])
+        self._max_new_tokens = max_new_tokens
+        self._timeout = timeout
+        self._cache: Dict[str, str] = {}
+        self._call_log: List[Dict[str, Any]] = []
+
+    def has(self, agent_kind: str) -> bool:
+        return agent_kind in self._kinds
+
+    def call(
+        self,
+        agent_kind: str,
+        example_id: int,
+        question: str,
+        context: str,
+        choices: Dict[str, str],
+        cache_namespace: str = "default",
+    ) -> str:
+        key = f"{cache_namespace}::{agent_kind}::{int(example_id)}"
+        if key in self._cache:
+            self._call_log.append({
+                "ts": int(time.time()),
+                "agent_kind": agent_kind,
+                "example_id": int(example_id),
+                "cache_hit": True,
+            })
+            return self._cache[key]
+
+        messages = build_runtime_messages(
+            agent_kind=agent_kind,
+            question=question,
+            context=context,
+            choices=choices,
+        )
+        payload = {
+            "model": agent_kind,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": self._max_new_tokens,
+        }
+        resp = _requests.post(
+            f"{self._server_url}/v1/chat/completions",
+            json=payload,
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+
         self._cache[key] = text
         self._call_log.append({
             "ts": int(time.time()),

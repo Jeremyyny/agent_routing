@@ -532,6 +532,7 @@ def run_train_manager_grpo(
     wandb_entity: str = "",
     wandb_run_name: str = "",
     task_description: str = "",
+    subagent_server_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     from ..manager.grpo_train import ManagerGRPOConfig, train_manager_grpo
 
@@ -562,6 +563,7 @@ def run_train_manager_grpo(
         wandb_entity=wandb_entity,
         wandb_run_name=wandb_run_name,
         task_description=task_description,
+        subagent_server_url=subagent_server_url,
     )
     train_manager_grpo(cfg)
     return {"manager_dir": out_dir, "fail_buffer": os.path.join(out_dir, "fail_buffer.jsonl")}

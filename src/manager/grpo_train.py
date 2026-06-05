@@ -1,14 +1,16 @@
 """Manager GRPO training loop.
 
 Wires together:
-  - SubagentPool (three frozen tools)
+  - SubagentPool (three frozen tools) OR RemoteSubagentPool (vLLM HTTP server)
   - ManagerToolEnvironment OR argument-binding tools
   - GRPOTrainer with the binary correctness reward
   - W&B logging (optional)
 
-Critical detail: subagents are loaded ONCE on the same device as the manager
-(Qwen3-0.6B x4 on a single GPU is fine; ~3-4GB total at bf16). For larger base
-models we'd need device sharding, but that's out of scope here.
+For full-parameter GRPO on 8B+ models with 4 GPUs, set subagent_server_url in
+ManagerGRPOConfig to point at a vLLM server (GPU 0) serving the three subagents.
+The training processes (GPUs 1-3) then carry zero subagent weight, leaving all
+VRAM for ZeRO Stage 3 manager sharding. See scripts/start_subagent_server.sh
+and scripts/train_manager_grpo_multigpu.sh for the launch workflow.
 """
 from __future__ import annotations
 
@@ -41,7 +43,7 @@ except Exception:
     HAS_RESP_SCHEMA = False
 
 from ..benchmarks.base import StandardRow
-from ..subagents.runtime import FrozenSubagent, SubagentPool
+from ..subagents.runtime import FrozenSubagent, RemoteSubagentPool, SubagentPool
 from ..utils.io import write_json
 from ..utils.seed import set_seed
 from .prompt import build_manager_system_prompt, build_manager_user_message
@@ -195,6 +197,7 @@ class ManagerGRPOConfig:
     tool_use_bonus: float = 0.0
     full_parameter_rl: bool = False      # if true, merge init adapter and train all model weights
     binding_mode: str = "auto"           # auto | environment | argument
+    subagent_server_url: Optional[str] = None  # if set, call subagents via vLLM HTTP (no local model load)
     use_wandb: bool = False
     wandb_project: str = "agent_routing"
     wandb_entity: str = ""
@@ -221,16 +224,28 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
     print(f"[MANAGER_GRPO] binding_mode={binding_mode}")
 
     # ---- Build subagent pool ----
-    pool = SubagentPool()
-    if cfg.extractor_adapter:
-        pool.register(FrozenSubagent(cfg.base_model, cfg.extractor_adapter, "extractor", device))
-    if cfg.reasoner_adapter:
-        pool.register(FrozenSubagent(cfg.base_model, cfg.reasoner_adapter, "reasoner", device))
-    if cfg.rule_applier_adapter:
-        pool.register(FrozenSubagent(cfg.base_model, cfg.rule_applier_adapter, "rule_applier", device))
-    if not pool._agents:
-        raise ValueError("At least one subagent adapter must be provided.")
-    print(f"[MANAGER_GRPO] subagents loaded: {sorted(pool._agents.keys())}")
+    if cfg.subagent_server_url:
+        # Multi-GPU mode: subagents are served by a vLLM process on a dedicated GPU.
+        # No model weights are loaded here; all VRAM stays available for ZeRO3.
+        pool = RemoteSubagentPool(
+            server_url=cfg.subagent_server_url,
+            registered_kinds=["extractor", "reasoner", "rule_applier"],
+        )
+        print(f"[MANAGER_GRPO] using remote subagent pool -> {cfg.subagent_server_url}")
+    else:
+        pool = SubagentPool()
+        if cfg.extractor_adapter:
+            pool.register(FrozenSubagent(cfg.base_model, cfg.extractor_adapter, "extractor", device))
+        if cfg.reasoner_adapter:
+            pool.register(FrozenSubagent(cfg.base_model, cfg.reasoner_adapter, "reasoner", device))
+        if cfg.rule_applier_adapter:
+            pool.register(FrozenSubagent(cfg.base_model, cfg.rule_applier_adapter, "rule_applier", device))
+        if not pool._agents:
+            raise ValueError(
+                "At least one subagent adapter must be provided, "
+                "or set subagent_server_url to use a vLLM server."
+            )
+        print(f"[MANAGER_GRPO] subagents loaded: {sorted(pool._agents.keys())}")
 
     _init_globals(pool, cfg.rows)
 
@@ -400,13 +415,19 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
     trainer.model.save_pretrained(cfg.out_dir)
     manager_tok.save_pretrained(cfg.out_dir)
 
+    subagent_keys = (
+        sorted(pool._kinds)
+        if isinstance(pool, RemoteSubagentPool)
+        else sorted(pool._agents.keys())
+    )
     write_json(os.path.join(cfg.out_dir, "manager_run_config.json"), {
         "base_model": cfg.base_model,
         "binding_mode": binding_mode,
         "n_train_rows": len(cfg.rows),
-        "subagents": sorted(pool._agents.keys()),
+        "subagents": subagent_keys,
         "manager_adapter": cfg.manager_adapter,
         "full_parameter_rl": bool(cfg.full_parameter_rl),
+        "subagent_server_url": cfg.subagent_server_url or "",
         "routing_efficiency_bonus": cfg.routing_efficiency_bonus,
         "tool_use_bonus": cfg.tool_use_bonus,
     })

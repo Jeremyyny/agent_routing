@@ -137,6 +137,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mgr_use_wandb", action="store_true")
     parser.add_argument("--mgr_init_adapter", type=str, default="",
                         help="Optional manager LoRA adapter to initialize GRPO from, e.g. outputs/manager/<id>/sft_evolved.")
+    parser.add_argument("--subagent_server_url", type=str, default="",
+                        help="vLLM HTTP server URL for subagents (multi-GPU mode). "
+                             "E.g. http://localhost:8000. When set, no subagent weights are loaded "
+                             "into the training processes; use with accelerate + ZeRO Stage 3.")
     parser.add_argument("--wandb_project", type=str, default="agent_routing")
     parser.add_argument("--wandb_entity", type=str, default="")
     parser.add_argument("--wandb_run_name", type=str, default="")
@@ -393,6 +397,7 @@ def main() -> None:
             wandb_entity=args.wandb_entity,
             wandb_run_name=args.wandb_run_name,
             task_description=args.task_description,
+            subagent_server_url=(args.subagent_server_url or None),
         )
         print("[TRAIN_MGR_GRPO]", result)
         return
