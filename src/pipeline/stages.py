@@ -85,6 +85,9 @@ class StageContext:
     def manager_grpo_dir(self) -> str:
         return os.path.join(self.manager_root, "grpo")
 
+    def manager_coldstart_dir(self) -> str:
+        return os.path.join(self.manager_root, "sft_coldstart")
+
     def manager_sft_dir(self) -> str:
         return os.path.join(self.manager_root, "sft_evolved")
 
@@ -613,29 +616,56 @@ def run_manager_coldstart_sft(
     teacher_model: Optional[str] = None,
     n_samples: int = 300,
     task_description: str = "",
+    epochs: int = 1,
+    lr: float = 2e-5,
+    max_seq_len: int = 4096,
+    per_device_batch_size: int = 1,
+    gradient_accumulation_steps: int = 8,
+    use_lora: bool = True,
+    max_steps: int = -1,
 ) -> Dict[str, Any]:
-    from ..manager.evolve import ColdStartSFTConfig, build_manager_sft_from_rows
+    from ..manager.evolve import (
+        ColdStartSFTConfig, ManagerSFTConfig,
+        build_manager_sft_from_rows, train_manager_sft,
+    )
 
     teacher = None
     if teacher_provider and teacher_model:
         teacher = _build_teacher(teacher_provider, teacher_model, ctx)
 
-    out_dir = ctx.evolve_dir()
+    data_dir = ctx.evolve_dir()
     cfg = ColdStartSFTConfig(
         base_model=ctx.base_model,
         extractor_adapter=ctx.adapter_path("extractor"),
         reasoner_adapter=ctx.adapter_path("reasoner"),
         rule_applier_adapter=ctx.adapter_path("rule_applier"),
         rows=rows,
-        out_dir=out_dir,
+        out_dir=data_dir,
         teacher=teacher,
         seed=ctx.seed,
         n_samples=n_samples,
         binding_mode=("argument" if ctx.binding_mode == "argument" else "environment"),
         task_description=task_description,
     )
-    out_path = build_manager_sft_from_rows(cfg)
-    return {"sft_jsonl": out_path, "out_dir": out_dir}
+    sft_jsonl = build_manager_sft_from_rows(cfg)
+
+    print(f"[COLDSTART] training manager on {sft_jsonl} ...")
+    train_cfg = ManagerSFTConfig(
+        base_model=ctx.base_model,
+        train_jsonl=sft_jsonl,
+        out_dir=ctx.manager_coldstart_dir(),
+        seed=ctx.seed,
+        max_seq_len=max_seq_len,
+        learning_rate=lr,
+        num_train_epochs=epochs,
+        per_device_batch_size=per_device_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        use_lora=use_lora,
+        max_steps=max_steps,
+    )
+    train_manager_sft(train_cfg)
+    print(f"[COLDSTART] manager saved -> {ctx.manager_coldstart_dir()}")
+    return {"sft_jsonl": sft_jsonl, "adapter_dir": ctx.manager_coldstart_dir()}
 
 
 # --------------------- Stage: manager SFT (post-evolve) ---------------------

@@ -204,8 +204,15 @@ def _build_manager_tool_sft_rows(
     task_description: str,
     cache_namespace: str,
 ) -> List[Dict[str, Any]]:
+    try:
+        from tqdm import tqdm
+        _iter = tqdm(rows, desc=f"[{cache_namespace}] building SFT rows", unit="ex")
+    except ImportError:
+        _iter = rows
+
     sft_rows: List[Dict[str, Any]] = []
-    for idx, row in enumerate(rows):
+    t0 = time.time()
+    for idx, row in enumerate(_iter):
         eid = int(row.example_id)
         sys_prompt = build_manager_system_prompt(
             label_keys=list(row.choices.keys()),
@@ -278,6 +285,9 @@ def _build_manager_tool_sft_rows(
             "prompt": list(history),
             "response": [{"role": "assistant", "content": final_text}],
         })
+        if (idx + 1) % 50 == 0:
+            elapsed = time.time() - t0
+            print(f"  [{cache_namespace}] {idx+1}/{len(rows)} examples | {len(sft_rows)} SFT turns | {elapsed:.0f}s elapsed")
     return sft_rows
 
 
@@ -387,6 +397,7 @@ def build_manager_sft_from_rows(cfg: ColdStartSFTConfig) -> str:
     if cfg.n_samples > 0:
         sample = sample[:cfg.n_samples]
 
+    print(f"[COLDSTART] building SFT data for {len(sample)} examples | subagents={available_kinds}")
     sft_rows = _build_manager_tool_sft_rows(
         rows=sample,
         pool=pool,
@@ -503,7 +514,12 @@ def train_manager_sft(cfg: ManagerSFTConfig) -> None:
     rows = read_jsonl(cfg.train_jsonl)
     if not rows:
         raise ValueError(f"No rows in {cfg.train_jsonl}")
+    print(f"[MANAGER_SFT] tokenizing {len(rows)} rows ...")
     train_ds = _tokenize_manager_sft(rows, tok, cfg.max_seq_len)
+    total_steps = (len(train_ds) // (cfg.per_device_batch_size * cfg.gradient_accumulation_steps)) * cfg.num_train_epochs
+    if cfg.max_steps > 0:
+        total_steps = min(total_steps, cfg.max_steps)
+    print(f"[MANAGER_SFT] {len(train_ds)} train examples | ~{total_steps} steps | lr={cfg.learning_rate} | epochs={cfg.num_train_epochs}")
     collator = DataCollatorForSeq2Seq(tok, padding=True, label_pad_token_id=-100, return_tensors="pt")
 
     args = TrainingArguments(
@@ -513,7 +529,7 @@ def train_manager_sft(cfg: ManagerSFTConfig) -> None:
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
         num_train_epochs=cfg.num_train_epochs,
-        logging_steps=10,
+        logging_steps=1,
         save_strategy="epoch",
         bf16=(cfg.bf16 and device == "cuda"),
         fp16=False,

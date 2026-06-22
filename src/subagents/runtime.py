@@ -71,6 +71,10 @@ class FrozenSubagent:
     _model: Any = field(init=False, default=None)
 
     def __post_init__(self):
+        if self.adapter_path:
+            p = self.adapter_path
+            if os.sep in p or p.count("/") > 1 or p.startswith("."):
+                self.adapter_path = os.path.abspath(p)
         self._tok = AutoTokenizer.from_pretrained(
             self.adapter_path or self.base_model, trust_remote_code=True
         )
@@ -261,6 +265,7 @@ class RemoteSubagentPool:
             "messages": messages,
             "temperature": 0.0,
             "max_tokens": self._max_new_tokens,
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
         }
         resp = _requests.post(
             f"{self._server_url}/v1/chat/completions",

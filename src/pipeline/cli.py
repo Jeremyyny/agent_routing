@@ -425,6 +425,13 @@ def main() -> None:
             teacher_model=(args.teacher_model or None),
             n_samples=args.coldstart_n_samples,
             task_description=args.task_description,
+            epochs=args.manager_sft_epochs,
+            lr=args.manager_sft_lr,
+            max_seq_len=args.sft_max_seq_len,
+            per_device_batch_size=args.sft_bs,
+            gradient_accumulation_steps=args.sft_grad_accum,
+            use_lora=(not args.sft_no_lora),
+            max_steps=args.sft_max_steps,
         )
         print("[MANAGER_COLDSTART_SFT]", result)
         return

@@ -309,6 +309,16 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
     train_dataset = Dataset.from_list(train_records)
 
     # ---- Manager model + tokenizer ----
+    # Resolve relative local paths to absolute so transformers doesn't mistake
+    # them for HuggingFace repo IDs (e.g. "outputs/manager/..." → OSError).
+    # Detection: a HF repo ID has exactly one "/" and no OS path separators;
+    # a local path has multiple "/" or contains os.sep (backslash on Windows).
+    if cfg.manager_adapter:
+        p = cfg.manager_adapter
+        looks_local = os.sep in p or p.count("/") > 1 or p.startswith(".")
+        if looks_local:
+            cfg.manager_adapter = os.path.abspath(p)
+
     manager_tok = AutoTokenizer.from_pretrained(
         cfg.manager_adapter or cfg.base_model, trust_remote_code=True
     )
