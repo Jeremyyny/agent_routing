@@ -36,6 +36,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="agent_routing")
     parser.add_argument("stage", type=str, choices=[
         "load_medqa",
+        "load_gpqa",
+        "load_mmlu_pro",
         "export_legalbench_jsonl",
         "synth_subagent",
         "export_deepseek_jsonl",
@@ -81,6 +83,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--legalbench_max_labels", type=int, default=12)
     parser.add_argument("--legalbench_normalized_cache", type=str, default="")
     parser.add_argument("--legalbench_refresh_cache", action="store_true")
+
+    # GPQA loading
+    parser.add_argument("--gpqa_hf_dataset", type=str, default="Idavidrein/gpqa")
+    parser.add_argument("--gpqa_subsets", type=str, default="gpqa_diamond",
+                        help="Comma-separated GPQA subset names: gpqa_main, gpqa_diamond, "
+                             "gpqa_extended, or 'all'. Default: gpqa_diamond.")
+    parser.add_argument("--gpqa_hf_cache", type=str, default="")
+    parser.add_argument("--gpqa_max", type=int, default=0)
+    parser.add_argument("--gpqa_answer_seed", type=int, default=42,
+                        help="Seed for A/B/C/D answer shuffling (keeps mapping deterministic).")
+    parser.add_argument("--gpqa_normalized_cache", type=str, default="")
+    parser.add_argument("--gpqa_refresh_cache", action="store_true")
+
+    # MMLU-Pro loading
+    parser.add_argument("--mmlu_pro_hf_dataset", type=str, default="TIGER-Lab/MMLU-Pro")
+    parser.add_argument("--mmlu_pro_categories", type=str, default="",
+                        help="Comma-separated category names to keep, e.g. 'math,physics'. "
+                             "Empty means all categories.")
+    parser.add_argument("--mmlu_pro_hf_cache", type=str, default="")
+    parser.add_argument("--mmlu_pro_max", type=int, default=0)
+    parser.add_argument("--mmlu_pro_splits", type=str, default="test,validation",
+                        help="Comma-separated HF split names to load.")
+    parser.add_argument("--mmlu_pro_normalized_cache", type=str, default="")
+    parser.add_argument("--mmlu_pro_refresh_cache", action="store_true")
 
     # Split sizes
     parser.add_argument("--train_size", type=int, default=600)
@@ -129,6 +155,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mgr_routing_efficiency_bonus", type=float, default=0.0)
     parser.add_argument("--mgr_tool_use_bonus", type=float, default=0.0,
                         help="Bonus added only when the final answer is correct and at least one native tool was called.")
+    parser.add_argument("--mgr_ccr_mode", action="store_true",
+                        help="Enable Calibrated Confidence Routing reward (log scoring rule). "
+                             "Replaces binary reward + routing_efficiency_bonus + tool_use_bonus.")
+    parser.add_argument("--mgr_ccr_p_high", type=float, default=0.9,
+                        help="CCR implicit confidence when manager calls 0 tools (default 0.9).")
+    parser.add_argument("--mgr_ccr_p_low", type=float, default=0.2,
+                        help="CCR implicit confidence when manager calls k_max tools (default 0.2).")
+    parser.add_argument("--mgr_ccr_k_max", type=int, default=3,
+                        help="CCR k_max; must match max_tool_calling_iterations (default 3).")
     parser.add_argument("--mgr_full_parameter_rl", action="store_true",
                         help="Run full-parameter GRPO. If --mgr_init_adapter is set, merge it into the base model first.")
     parser.add_argument("--mgr_max_steps", type=int, default=-1)
@@ -230,14 +265,87 @@ def _using_legalbench(args) -> bool:
     return bool(args.legalbench_normalized_cache or args.legalbench_configs)
 
 
+def _using_gpqa(args) -> bool:
+    return bool(getattr(args, "gpqa_normalized_cache", "") or getattr(args, "gpqa_subsets", ""))
+
+
+def _using_mmlu_pro(args) -> bool:
+    return bool(
+        getattr(args, "mmlu_pro_normalized_cache", "")
+        or getattr(args, "mmlu_pro_categories", "") != ""
+        # Explicit flag to use MMLU-Pro even with no category filter
+        or getattr(args, "use_mmlu_pro", False)
+    )
+
+
+def _load_gpqa_or_cache(args) -> List[StandardRow]:
+    cache = args.gpqa_normalized_cache or os.path.join(
+        args.output_root, "data", "gpqa_normalized.jsonl"
+    )
+    if args.gpqa_refresh_cache or not os.path.exists(cache):
+        rows = stages.run_load_gpqa(
+            dataset_name=args.gpqa_hf_dataset,
+            subsets=args.gpqa_subsets,
+            hf_cache_dir=(args.gpqa_hf_cache or None),
+            max_examples=args.gpqa_max,
+            answer_seed=args.gpqa_answer_seed,
+            cache_normalized_path=cache,
+        )
+    else:
+        rows = [stages.StandardRow(**r) for r in read_jsonl(cache)]
+        print(f"[LOAD_GPQA] loaded cached {len(rows)} rows -> {cache}")
+    return rows
+
+
+def _load_mmlu_pro_or_cache(args) -> List[StandardRow]:
+    cache = args.mmlu_pro_normalized_cache or os.path.join(
+        args.output_root, "data", "mmlu_pro_normalized.jsonl"
+    )
+    if args.mmlu_pro_refresh_cache or not os.path.exists(cache):
+        rows = stages.run_load_mmlu_pro(
+            dataset_name=args.mmlu_pro_hf_dataset,
+            categories=args.mmlu_pro_categories,
+            hf_cache_dir=(args.mmlu_pro_hf_cache or None),
+            max_examples=args.mmlu_pro_max,
+            splits=args.mmlu_pro_splits,
+            cache_normalized_path=cache,
+        )
+    else:
+        rows = [stages.StandardRow(**r) for r in read_jsonl(cache)]
+        print(f"[LOAD_MMLU_PRO] loaded cached {len(rows)} rows -> {cache}")
+    return rows
+
+
 def _load_benchmark_splits(args) -> dict:
     """Load the requested benchmark and return train/dev/test splits.
 
-    MedQA has native train/dev/test splits. LegalBench configs usually expose
-    few-shot train rows plus test rows, so for this pipeline we create a
-    deterministic split from the loaded LegalBench rows. This keeps subagent
-    SFT, manager GRPO, and evaluation disjoint.
+    Priority (first active wins): mmlu_pro > gpqa > legalbench > medqa.
+    GPQA and MMLU-Pro have no predefined train/dev/test split, so rows are
+    split deterministically using --train_size / --dev_size / --test_size.
     """
+    # MMLU-Pro: active when --mmlu_pro_normalized_cache is set OR
+    #           --mmlu_pro_categories is non-empty OR stage == load_mmlu_pro
+    if getattr(args, "stage", "") == "load_mmlu_pro" or _using_mmlu_pro(args):
+        rows = _load_mmlu_pro_or_cache(args)
+        train, dev, test = stages._split_rows(
+            rows=rows, train_size=args.train_size, dev_size=args.dev_size,
+            test_size=args.test_size, seed=args.seed,
+        )
+        print(f"[SPLIT/MMLU_PRO] train/dev/test = {len(train)}/{len(dev)}/{len(test)}")
+        return {"all": rows, "train": train, "dev": dev, "test": test}
+
+    # GPQA: active when --gpqa_normalized_cache is set OR stage == load_gpqa
+    if getattr(args, "stage", "") == "load_gpqa" or (
+        _using_gpqa(args) and not _using_legalbench(args)
+    ):
+        rows = _load_gpqa_or_cache(args)
+        train, dev, test = stages._split_rows(
+            rows=rows, train_size=args.train_size, dev_size=args.dev_size,
+            test_size=args.test_size, seed=args.seed,
+        )
+        print(f"[SPLIT/GPQA] train/dev/test = {len(train)}/{len(dev)}/{len(test)}")
+        return {"all": rows, "train": train, "dev": dev, "test": test}
+
     if _using_legalbench(args):
         rows = _load_legalbench_or_cache(args)
         train, dev, test = stages._split_rows(
@@ -283,6 +391,24 @@ def main() -> None:
 
     if args.stage == "load_medqa":
         _load_or_split(args)
+        return
+
+    if args.stage == "load_gpqa":
+        rows = _load_gpqa_or_cache(args)
+        train, dev, test = stages._split_rows(
+            rows=rows, train_size=args.train_size, dev_size=args.dev_size,
+            test_size=args.test_size, seed=args.seed,
+        )
+        print(f"[LOAD_GPQA] train/dev/test = {len(train)}/{len(dev)}/{len(test)}")
+        return
+
+    if args.stage == "load_mmlu_pro":
+        rows = _load_mmlu_pro_or_cache(args)
+        train, dev, test = stages._split_rows(
+            rows=rows, train_size=args.train_size, dev_size=args.dev_size,
+            test_size=args.test_size, seed=args.seed,
+        )
+        print(f"[LOAD_MMLU_PRO] train/dev/test = {len(train)}/{len(dev)}/{len(test)}")
         return
 
     if args.stage == "export_legalbench_jsonl":
@@ -389,6 +515,10 @@ def main() -> None:
             grpo_beta=args.mgr_grpo_beta,
             routing_efficiency_bonus=args.mgr_routing_efficiency_bonus,
             tool_use_bonus=args.mgr_tool_use_bonus,
+            ccr_mode=args.mgr_ccr_mode,
+            ccr_p_high=args.mgr_ccr_p_high,
+            ccr_p_low=args.mgr_ccr_p_low,
+            ccr_k_max=args.mgr_ccr_k_max,
             full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
             output_dir=(args.mgr_output_dir or None),
@@ -463,6 +593,10 @@ def main() -> None:
             grpo_beta=args.mgr_grpo_beta,
             routing_efficiency_bonus=args.mgr_routing_efficiency_bonus,
             tool_use_bonus=args.mgr_tool_use_bonus,
+            ccr_mode=args.mgr_ccr_mode,
+            ccr_p_high=args.mgr_ccr_p_high,
+            ccr_p_low=args.mgr_ccr_p_low,
+            ccr_k_max=args.mgr_ccr_k_max,
             full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
             output_dir=(args.mgr_output_dir or None),

@@ -1,17 +1,13 @@
-# Agent Routing — Manager + Three Subagents on MedQA
+# Agent Routing — Metacognitive Routing with Calibrated Confidence
 
-A pipeline for training a small manager LLM (Qwen3-0.6B by default) that learns to route between three SFT-trained subagents to solve MedQA. Subagents are trained on data synthesized by a **teacher model** (Claude, GPT, or DeepSeek), then the manager is trained with GRPO using the trained subagents as native tools, with an evolve loop that recycles GRPO failures into manager SFT data.
+A pipeline for training a manager LLM that learns **when to consult which specialized expert**. The manager decides whether to call 0–3 frozen subagents (extractor / reasoner / rule_applier) before answering a multiple-choice question. Routing is trained with GRPO using a **Calibrated Confidence Routing (CCR)** reward derived from the logarithmic scoring rule — the manager is rewarded not just for being correct but for expressing calibrated uncertainty through its routing choices.
 
-The whole thing is built for one specific experiment: **comparing how teacher choice (Claude vs GPT vs DeepSeek) affects every layer of the resulting system** — synthesis quality, subagent reliability, and final manager accuracy.
-
----
-
-## What it builds
+Benchmarks supported: **MedQA-USMLE**, **LegalBench**, **MMLU-Pro**, **GPQA**.
 
 ```
                        ┌────────────────────────┐
-                       │   Manager (Qwen3-0.6B) │
-                       │   GRPO + Evolve SFT    │
+                       │   Manager (Qwen3)      │
+                       │   GRPO + CCR reward    │
                        └────┬────┬───────┬──────┘
                             │    │       │
               ┌─────────────┘    │       └──────────────┐
@@ -19,7 +15,7 @@ The whole thing is built for one specific experiment: **comparing how teacher ch
    ┌──────────────────┐ ┌─────────────────┐ ┌──────────────────────┐
    │  ExtractorAgent  │ │  ReasonerAgent  │ │  RuleApplierAgent    │
    │  (frozen, LoRA)  │ │ (frozen, LoRA)  │ │  (frozen, LoRA)      │
-   └────────┬─────────┘ └────────┬────────┘ └──────────┬───────────┘  
+   └──────────────────┘ └─────────────────┘ └──────────────────────┘
             │                    │                     │
             └────────────────────┼─────────────────────┘
                                  │
@@ -30,20 +26,14 @@ The whole thing is built for one specific experiment: **comparing how teacher ch
                  └───────────────────────────────┘
 ```
 
-Three subagents, all schema-constrained JSON output:
-
-- **ExtractorAgent** — pulls clinical/factual signals from the question stem (and context, when applicable).
-- **ReasonerAgent** — produces a structured reasoning scaffold: sub-questions, required knowledge, per-choice support/against analysis.
-- **RuleApplierAgent** — identifies applicable medical decision rules/criteria and maps facts to their elements.
-
-**Hard invariant**: subagents NEVER produce the final answer. The manager is the sole authority on the `ANSWER_<TOKEN>` final line. This is enforced by pydantic schemas + a leakage auditor at synthesis time.
+**Hard invariant**: subagents never produce the final answer. The manager is the sole authority on the `ANSWER_<TOKEN>` final line. This is enforced by pydantic schemas + a leakage auditor at synthesis time.
 
 ---
 
 ## Install
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -55,16 +45,109 @@ export OPENAI_API_KEY=...       # for GPT
 export DEEPSEEK_API_KEY=...     # for DeepSeek
 ```
 
-You only need the key for the teacher you're currently using — pipelines are run one teacher at a time.
+---
+
+## Data budget and recommended splits
+
+Each benchmark follows the same split structure. The numbers below are the recommended settings for reproducible paper results.
+
+### Why these numbers
+
+| Pool | MedQA | LegalBench (5 tasks) | MMLU-Pro | GPQA-Diamond |
+|---|---|---|---|---|
+| Total available | ~12 k | ~800–1 500 | ~12 k test | 198 |
+| Subagent SFT (per agent) | **500** | **150** | eval only | eval only |
+| Manager cold-start SFT | **300** | **80** | eval only | eval only |
+| Manager GRPO train | **600** | **200** | eval only | eval only |
+| Dev (sanity check) | 200 | 100 | — | — |
+| **Test / Eval** | **500** | **100** | **500** | **198 (all)** |
+
+**MMLU-Pro** — The community uses the full `test` split for comparison with other papers; training on any part of it breaks comparability. Use it as a zero-shot generalisation probe only.
+
+**GPQA-Diamond** — Only 198 questions exist; too small and too domain-specific for training. Use all 198 as a hard-case evaluation.
+
+> **Paper claim enabled by this split**: "A routing policy trained on domain X generalises to domains Y and Z without retraining." MedQA/LegalBench train routing; MMLU-Pro/GPQA test whether calibrated uncertainty is domain-agnostic.
+
+### Data overlap rules (critical for fair evaluation)
+
+The three subagent SFT pools, the cold-start pool, and the GRPO pool must be **disjoint** by `example_id`. The `--exclude_sft_example_ids` flag enforces this — pass all three subagent SFT JSONL paths and the GRPO trainer will skip any row whose `example_id` appears in those files.
+
+---
+
+## Synthetic data and CCR: are they in conflict?
+
+No. They operate on completely different parts of the system and solve complementary problems.
+
+```
+Stage                │  Data source        │  What it teaches
+─────────────────────┼─────────────────────┼────────────────────────────────────
+Subagent SFT         │  Synthetic (teacher)│  WHAT to output (JSON schema, facts)
+Manager cold-start   │  Synthetic (teacher)│  HOW to format tool calls (format)
+Manager GRPO + CCR   │  Outcome (GT label) │  WHEN to call tools (calibration)
+```
+
+SFT can replicate the teacher's routing choices, but the teacher's implicit confidence is not observable and cannot be learned from demonstrations alone. CCR fills exactly the gap SFT cannot: it uses the binary outcome signal (correct/incorrect) to shape a calibrated routing policy through RL.
+
+> **One-liner for the paper**: "SFT initialises tool-calling capability; CCR-GRPO optimises calibration through outcome supervision — they are sequential, not competing."
+
+---
+
+## CCR reward explained
+
+When `--mgr_ccr_mode` is set, the binary 0/1 reward is replaced by the **logarithmic scoring rule** applied to the routing decision's implicit confidence:
+
+```
+p(k) = p_high + (p_low − p_high) × k / k_max   # linear from confident → uncertain
+R    = log p(k)        if correct
+R    = log(1 − p(k))   if incorrect
+```
+
+With defaults `p_high=0.9`, `p_low=0.2`, `k_max=3`:
+
+| k | Correct | Incorrect | Interpretation |
+|---|---|---|---|
+| 0 | −0.11 **(best)** | −2.30 **(worst)** | High-stakes: efficient if right, harshly penalised if overconfident |
+| 1 | −0.51 | −1.61 | Moderate confidence |
+| 2 | −0.92 | −1.20 | Low confidence |
+| 3 | −1.61 | −0.22 | Lowest confidence: safe floor when genuinely uncertain |
+
+GRPO normalises rewards within a group (same question, multiple rollouts), so the absolute scale does not matter. What matters is the within-group ordering, which encodes: *"for easy questions, call 0 tools; for hard questions, call more tools."*
+
+---
+
+## Post-training analysis: ECE and routing entropy
+
+After training, compute two calibration metrics from the `train_raw_trace.jsonl` file:
+
+```python
+from src.utils.io import read_jsonl
+from src.manager.reward import compute_ece, compute_routing_entropy
+
+records = read_jsonl("outputs/manager/<teacher_id>/grpo/train_raw_trace.jsonl")
+
+# Expected Calibration Error: compares p(k) to empirical accuracy per k-bucket
+print(compute_ece(records, p_high=0.9, p_low=0.2))
+# → {"ece": 0.08, "buckets": {0: {"accuracy": 0.87, "implicit_confidence": 0.90, ...}, ...}}
+
+# Routing entropy: H over the empirical tool-call distribution
+print(compute_routing_entropy(records))
+# → {"entropy": 0.94, "normalized_entropy": 0.60, "distribution": {"0": 0.45, "1": 0.22, ...}}
+```
+
+**Interpreting routing entropy by benchmark** (expected after CCR training):
+
+| Benchmark | Expected normalized entropy | Interpretation |
+|---|---|---|
+| MedQA (4-choice) | 0.4–0.6 | Medium difficulty; manager confident on ~40–50% |
+| LegalBench | 0.3–0.5 | Varies by task; rule-based tasks are easier to route |
+| MMLU-Pro (10-choice) | 0.6–0.8 | Higher entropy: more genuine uncertainty |
+| GPQA-Diamond | 0.8–1.0 | Expert-level: manager should call tools on almost everything |
 
 ---
 
 ## Multi-GPU Full-Parameter GRPO (4× H100 / H200)
 
-For 8B+ base models, full-parameter GRPO requires ZeRO Stage 3 and a dedicated
-GPU for subagent inference. The key problem: with standard DDP, every training
-process loads the full manager model **and** all three subagents — far too much
-VRAM. The solution separates the two concerns:
+For 8B+ base models, full-parameter GRPO requires ZeRO Stage 3 and a dedicated GPU for subagent inference:
 
 ```
 GPU 0  →  vLLM server  (3 subagents, shared base + 3 LoRA adapters, ~27 GB)
@@ -73,167 +156,81 @@ GPU 2  ├→ accelerate + DeepSpeed ZeRO Stage 3  (manager training, ~52 GB/GPU
 GPU 3  ┘
 ```
 
-### Step 0: Install dependencies in two separate environments
+### Step 0: install dependencies
 
 ```bash
-# Training environment (.venv already has TRL/accelerate/transformers)
 pip install accelerate deepspeed
 
-# Separate vLLM environment (avoids version conflicts with TRL)
 conda create -n vllm_env python=3.11 -y
 conda activate vllm_env
 pip install vllm
 ```
 
-### Step 1: Start the subagent vLLM server on GPU 0
-
-Run in a **separate terminal** (keep it alive for the duration of training):
+### Step 1: start the subagent vLLM server (GPU 0)
 
 ```bash
 conda activate vllm_env
-bash scripts/start_subagent_server.sh Qwen/Qwen3-8B openai_us4_500_runtime_raw
+bash scripts/start_subagent_server.sh Qwen/Qwen3-8B <teacher_id>
 ```
 
-This loads the base model once (~16 GB) and registers three LoRA adapters (~1 GB
-total). Verify it is ready:
-
+Verify:
 ```bash
-curl http://localhost:8000/health
-# → {"status":"ok"}
-
-curl http://localhost:8000/v1/models | python -m json.tool
-# should list: extractor, reasoner, rule_applier
+curl http://localhost:8000/health       # → {"status":"ok"}
+curl http://localhost:8000/v1/models | python -m json.tool  # lists extractor, reasoner, rule_applier
 ```
 
-### Step 2: Run full-parameter GRPO on GPUs 1-2-3
-
-In your training environment:
+### Step 2: run GRPO on GPUs 1-2-3
 
 ```bash
 source .venv/bin/activate
-export PYTHONUTF8=1
-
-bash scripts/train_manager_grpo_multigpu.sh openai_us4_500_runtime_raw \
+bash scripts/train_manager_grpo_multigpu.sh <teacher_id> \
     --base_model Qwen/Qwen3-8B \
-    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
-    --train_size 1200 \
-    --exclude_sft_example_ids outputs/sft_data/openai_us4_500/extractor_runtime_raw_sft.jsonl \
-    --exclude_sft_example_ids outputs/sft_data/openai_us4_500/reasoner_runtime_raw_sft.jsonl \
-    --exclude_sft_example_ids outputs/sft_data/openai_us4_500/rule_applier_runtime_raw_sft.jsonl \
-    --mgr_init_adapter outputs/manager/openai_us4_500_runtime_raw/sft_evolved \
-    --mgr_output_dir outputs/manager/openai_us4_500_runtime_raw/grpo_full \
-    --mgr_max_steps 200 \
-    --mgr_use_wandb --wandb_project agent_routing \
-    --wandb_run_name openai_us4_500_runtime_raw_grpo_full_8b \
-    --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
+    --medqa_normalized_cache outputs/data/medqa_normalized.jsonl \
+    --train_size 600 \
+    --mgr_ccr_mode --mgr_ccr_p_high 0.9 --mgr_ccr_p_low 0.2 \
+    ...
 ```
 
-The script polls `http://localhost:8000/health` for up to 120 s before launching
-training. If it times out, check that `start_subagent_server.sh` is still running.
+### Memory budget (8B, bf16, 4× 90–100 GB cards)
 
-### Manual equivalent (without the shell scripts)
-
-Terminal 1 — vLLM server:
-
-```bash
-conda activate vllm_env
-CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen3-8B \
-    --enable-lora --max-lora-rank 64 \
-    --lora-modules \
-        extractor=outputs/adapters/openai_us4_500_runtime_raw/extractor_adapter \
-        reasoner=outputs/adapters/openai_us4_500_runtime_raw/reasoner_adapter \
-        rule_applier=outputs/adapters/openai_us4_500_runtime_raw/rule_applier_adapter \
-    --port 8000 --dtype bfloat16 --trust-remote-code --max-model-len 4096
-```
-
-Terminal 2 — training:
-
-```bash
-source .venv/bin/activate
-CUDA_VISIBLE_DEVICES=1,2,3 PYTHONUTF8=1 \
-accelerate launch --config_file configs/accelerate_zero3.yaml \
-    -m src.pipeline.cli train_manager_grpo \
-    --base_model Qwen/Qwen3-8B \
-    --teacher_id openai_us4_500_runtime_raw \
-    --subagent_server_url http://localhost:8000 \
-    --mgr_full_parameter_rl \
-    --mgr_init_adapter outputs/manager/openai_us4_500_runtime_raw/sft_evolved \
-    --mgr_output_dir outputs/manager/openai_us4_500_runtime_raw/grpo_full \
-    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
-    --train_size 1200 \
-    --exclude_sft_example_ids outputs/sft_data/openai_us4_500/extractor_runtime_raw_sft.jsonl \
-    --exclude_sft_example_ids outputs/sft_data/openai_us4_500/reasoner_runtime_raw_sft.jsonl \
-    --exclude_sft_example_ids outputs/sft_data/openai_us4_500/rule_applier_runtime_raw_sft.jsonl \
-    --mgr_bs 2 --mgr_num_generations 2 \
-    --mgr_max_completion_length 2048 --mgr_temperature 1.0 \
-    --mgr_grpo_beta 0.01 --mgr_tool_use_bonus 0.2 \
-    --mgr_max_steps 200 \
-    --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
-```
-
-### Evaluation after multi-GPU GRPO
-
-Evaluation loads subagents locally (single GPU, no vLLM needed):
-
-```bash
-python -X utf8 -m src.pipeline.cli eval_manager_tools \
-    --base_model Qwen/Qwen3-8B \
-    --teacher_id openai_us4_500_runtime_raw \
-    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
-    --eval_n_samples 1270 --test_size 1270 \
-    --eval_manager_dir outputs/manager/openai_us4_500_runtime_raw/grpo_full \
-    --task_description "You are a manager agent solving USMLE-style medical multiple-choice questions."
-```
-
-### Memory budget (8B model, bf16, 4× 90–100 GB cards)
-
-| GPU | Role | VRAM used |
-|-----|------|-----------|
+| GPU | Role | VRAM |
+|-----|------|------|
 | 0 | vLLM: base (16 GB) + 3 adapters + KV cache | ~27 GB |
-| 1 | ZeRO3 shard: params+grad+Adam+ref (112 GB ÷ 3) | ~52 GB |
-| 2 | same | ~52 GB |
-| 3 | same | ~52 GB |
-
-No CPU offload required with 90–100 GB cards. See `configs/accelerate_zero3.yaml`
-to adjust `num_processes` or enable offload if needed.
+| 1–3 | ZeRO3 shard | ~52 GB each |
 
 ---
 
-## End-to-end on MedQA (full-parameter GRPO, 4× GPU)
-
-Complete pipeline: subagent SFT → cold-start → full-param GRPO → eval.
-Replace the env vars at the top and every command below will work as-is.
+## End-to-end on MedQA
 
 ```bash
-# ── configure once ────────────────────────────────────────────────────────────
-export TEACHER_ID=claude_sonnet_4_5       # controls all output paths
-export PROVIDER=anthropic                 # anthropic | openai | deepseek
+# ── configure once ─────────────────────────────────────────────────────────
+export TEACHER_ID=claude_sonnet_4_5
+export PROVIDER=anthropic
 export MODEL=claude-sonnet-4-5
 export BASE_MODEL=Qwen/Qwen3-8B
 export TASK_DESC="You are a manager agent solving USMLE-style medical multiple-choice questions."
 export PYTHONUTF8=1
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────
 
-# ── Step 1: cache MedQA from HuggingFace (idempotent) ─────────────────────────
+# Step 1 — cache MedQA (idempotent)
 python -m src.pipeline.cli load_medqa \
     --base_model "$BASE_MODEL" \
-    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
-    --train_size 1200 --dev_size 200 --test_size 1270
+    --medqa_normalized_cache outputs/data/medqa_normalized.jsonl \
+    --train_size 1400 --dev_size 200 --test_size 500
 
-# ── Step 2: synthesize subagent SFT data (500 samples each) ──────────────────
+# Step 2 — synthesize subagent SFT data (500 examples each)
 for KIND in extractor reasoner rule_applier; do
   python -m src.pipeline.cli synth_subagent \
       --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" \
       --teacher_provider "$PROVIDER" --teacher_model "$MODEL" \
       --agent_kind "$KIND" --n_samples 500 \
-      --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
-      --train_size 1200 --test_size 1270 \
+      --medqa_normalized_cache outputs/data/medqa_normalized.jsonl \
+      --train_size 1400 --dev_size 200 --test_size 500 \
       --task_description "$TASK_DESC"
 done
 
-# ── Step 3: SFT-train the three subagents ────────────────────────────────────
+# Step 3 — SFT-train the three subagents
 for KIND in extractor reasoner rule_applier; do
   python -m src.pipeline.cli train_subagent \
       --base_model "$BASE_MODEL" \
@@ -241,81 +238,67 @@ for KIND in extractor reasoner rule_applier; do
       --sft_epochs 3 --sft_lr 2e-4
 done
 
-# ── Step 4: validate subagents (recommended before manager training) ──────────
+# Step 4 — validate subagents (json_ok_rate and schema_ok_rate should be > 0.9)
 python -m src.pipeline.cli eval_subagents \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
-    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
+    --medqa_normalized_cache outputs/data/medqa_normalized.jsonl \
     --eval_n_samples 50
 
-# Check: json_ok_rate and schema_ok_rate should both be > 0.9 for each subagent.
-# If they're low, run more SFT epochs or increase --n_samples.
-
-# ── Step 5: build manager cold-start SFT ─────────────────────────────────────
-# Without this, the manager won't discover tool calls during GRPO
-# (tools/call_frequency will stay at 0).
+# Step 5 — build and train manager cold-start SFT (300 examples)
 python -m src.pipeline.cli manager_coldstart_sft \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
-    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
-    --train_size 1200 --test_size 1270 \
+    --medqa_normalized_cache outputs/data/medqa_normalized.jsonl \
+    --train_size 1400 --dev_size 200 --test_size 500 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
     --coldstart_n_samples 300 \
     --task_description "$TASK_DESC"
 
-# ── Step 6: SFT-train manager on cold-start demonstrations ───────────────────
 python -m src.pipeline.cli train_manager_sft \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
     --manager_sft_train_jsonl "outputs/manager/${TEACHER_ID}/evolve/manager_sft_coldstart.jsonl" \
     --manager_sft_epochs 1 --manager_sft_lr 2e-5
 
-# ── Step 7: full-parameter GRPO on 4 GPUs ────────────────────────────────────
-# Terminal A — start vLLM subagent server on GPU 0 (keep it running):
-#   conda activate vllm_env
-#   bash scripts/start_subagent_server.sh "$BASE_MODEL" "$TEACHER_ID"
-
-# Terminal B — run GRPO training on GPUs 1-2-3:
+# Step 6 — GRPO with CCR reward (600 train rows, non-overlapping with SFT data)
+# Terminal A — vLLM server:  bash scripts/start_subagent_server.sh "$BASE_MODEL" "$TEACHER_ID"
+# Terminal B — training:
 bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
     --base_model "$BASE_MODEL" \
-    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
-    --train_size 1200 --test_size 1270 \
+    --medqa_normalized_cache outputs/data/medqa_normalized.jsonl \
+    --train_size 600 --dev_size 200 --test_size 500 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
-    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_evolved" \
-    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_full" \
-    --mgr_bs 2 --mgr_num_generations 2 \
-    --mgr_max_steps 200 \
+    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_coldstart" \
+    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
+    --mgr_ccr_mode --mgr_ccr_p_high 0.9 --mgr_ccr_p_low 0.2 \
+    --mgr_bs 2 --mgr_num_generations 6 \
+    --mgr_max_steps 300 \
     --mgr_use_wandb --wandb_project agent_routing \
-    --wandb_run_name "${TEACHER_ID}_grpo_full" \
+    --wandb_run_name "${TEACHER_ID}_medqa_ccr" \
     --task_description "$TASK_DESC"
 
-# ── Step 8: evaluate manager with subagents in the loop ───────────────────────
+# Step 7 — evaluate on 500-example held-out test set
 python -m src.pipeline.cli eval_manager_tools \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
-    --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
-    --eval_n_samples 1270 --test_size 1270 \
-    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_full" \
+    --medqa_normalized_cache outputs/data/medqa_normalized.jsonl \
+    --eval_n_samples 500 --test_size 500 \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
     --task_description "$TASK_DESC"
-
-# Results:
-#   outputs/eval/$TEACHER_ID/manager_tool_eval_report.json  ← accuracy, tool_call_rate
-#   outputs/eval/$TEACHER_ID/manager_tool_eval.jsonl        ← per-example detail
 ```
 
 ---
 
-## End-to-end on LegalBench (full-parameter GRPO, 4× GPU)
+## End-to-end on LegalBench
 
-Same pipeline, different benchmark. Uses 5 LegalBench subtasks that have
-a small fixed label set and load cleanly together.
+Uses 5 tasks with small fixed label sets. Total row count is modest (~800–1 500), so all split sizes are scaled down proportionally.
 
 ```bash
-# ── configure once ────────────────────────────────────────────────────────────
 export TEACHER_ID=legalbench_claude
 export PROVIDER=anthropic
 export MODEL=claude-sonnet-4-5
@@ -323,31 +306,26 @@ export BASE_MODEL=Qwen/Qwen3-8B
 export LB_CONFIGS="abercrombie,hearsay,personal_jurisdiction,proa,successor_liability"
 export TASK_DESC="You are a manager agent solving LegalBench multiple-choice legal classification tasks."
 export PYTHONUTF8=1
-# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Step 1: cache LegalBench (idempotent) ─────────────────────────────────────
-python -m src.pipeline.cli load_medqa \
-    --base_model "$BASE_MODEL"
-# Note: LegalBench rows are loaded on-demand by later stages via --legalbench_configs.
-# No separate load_legalbench command needed; the first synth_subagent call caches them.
+# Step 1 — cache LegalBench (idempotent after first run, drop --legalbench_refresh_cache)
+# Rows are loaded on-demand; pass --legalbench_normalized_cache to persist them.
 
-# ── Step 2: synthesize subagent SFT data ─────────────────────────────────────
-# Use 100 samples per subagent so manager training still has held-out train rows.
+# Step 2 — synthesize subagent SFT data (150 examples each)
 for KIND in extractor reasoner rule_applier; do
   python -m src.pipeline.cli synth_subagent \
       --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" \
       --teacher_provider "$PROVIDER" --teacher_model "$MODEL" \
-      --agent_kind "$KIND" --n_samples 100 \
+      --agent_kind "$KIND" --n_samples 150 \
       --legalbench_configs "$LB_CONFIGS" \
       --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
       --legalbench_refresh_cache \
-      --train_size 215 --test_size 95 \
+      --train_size 530 --dev_size 100 --test_size 100 \
       --task_description "$TASK_DESC"
 done
-# On subsequent runs, drop --legalbench_refresh_cache to reuse the cached rows.
+# After first run drop --legalbench_refresh_cache to reuse the cached file.
 
-# ── Step 3: SFT-train the three subagents ────────────────────────────────────
+# Step 3 — SFT subagents
 for KIND in extractor reasoner rule_applier; do
   python -m src.pipeline.cli train_subagent \
       --base_model "$BASE_MODEL" \
@@ -355,7 +333,7 @@ for KIND in extractor reasoner rule_applier; do
       --sft_epochs 3 --sft_lr 2e-4
 done
 
-# ── Step 4: validate subagents ────────────────────────────────────────────────
+# Step 4 — validate subagents
 python -m src.pipeline.cli eval_subagents \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
@@ -363,115 +341,205 @@ python -m src.pipeline.cli eval_subagents \
     --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
     --eval_n_samples 50
 
-# ── Step 5: cold-start manager ────────────────────────────────────────────────
+# Step 5 — cold-start manager (80 examples)
 python -m src.pipeline.cli manager_coldstart_sft \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
     --legalbench_configs "$LB_CONFIGS" \
     --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
-    --train_size 215 --test_size 95 \
+    --train_size 530 --dev_size 100 --test_size 100 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
-    --coldstart_n_samples 60 \
+    --coldstart_n_samples 80 \
     --task_description "$TASK_DESC"
 
-# ── Step 6: SFT-train manager on cold-start demonstrations ───────────────────
 python -m src.pipeline.cli train_manager_sft \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
     --manager_sft_train_jsonl "outputs/manager/${TEACHER_ID}/evolve/manager_sft_coldstart.jsonl" \
     --manager_sft_epochs 1 --manager_sft_lr 2e-5
 
-# ── Step 7: full-parameter GRPO on 4 GPUs ────────────────────────────────────
-# Terminal A — vLLM subagent server on GPU 0:
-#   conda activate vllm_env
-#   bash scripts/start_subagent_server.sh "$BASE_MODEL" "$TEACHER_ID"
-
-# Terminal B — GRPO training on GPUs 1-2-3:
+# Step 6 — GRPO with CCR (200 train rows)
 bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
     --base_model "$BASE_MODEL" \
     --legalbench_configs "$LB_CONFIGS" \
     --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
-    --train_size 215 --test_size 95 \
+    --train_size 200 --dev_size 100 --test_size 100 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
-    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_evolved" \
-    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_full" \
-    --mgr_bs 2 --mgr_num_generations 2 \
-    --mgr_max_steps 50 \
+    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_coldstart" \
+    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
+    --mgr_ccr_mode --mgr_ccr_p_high 0.9 --mgr_ccr_p_low 0.2 \
+    --mgr_bs 2 --mgr_num_generations 6 \
+    --mgr_max_steps 100 \
     --mgr_use_wandb --wandb_project agent_routing \
-    --wandb_run_name "${TEACHER_ID}_grpo_full" \
+    --wandb_run_name "${TEACHER_ID}_legalbench_ccr" \
     --task_description "$TASK_DESC"
 
-# ── Step 8: evaluate on the held-out LegalBench test split ───────────────────
+# Step 7 — evaluate on 100-example held-out test set
 python -m src.pipeline.cli eval_manager_tools \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
     --legalbench_configs "$LB_CONFIGS" \
     --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
-    --eval_n_samples 95 --test_size 95 \
-    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_full" \
+    --eval_n_samples 100 --test_size 100 \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
+    --task_description "$TASK_DESC"
+```
+
+---
+
+## MMLU-Pro: evaluation only (zero-shot generalisation)
+
+MMLU-Pro is used **as an evaluation benchmark only**. Training on any portion of its test set breaks comparability with the literature. The goal is to show that a CCR routing policy trained on MedQA or LegalBench generalises — without any MMLU-Pro training data — to a 10-option broad-knowledge benchmark.
+
+```bash
+export BASE_MODEL=Qwen/Qwen3-8B
+export TEACHER_ID=claude_sonnet_4_5       # reuse the MedQA-trained manager
+export TASK_DESC="You are a manager agent solving multiple-choice questions across diverse academic subjects."
+export PYTHONUTF8=1
+
+# Step 1 — download and cache MMLU-Pro test split (500 examples, stratified)
+python -m src.pipeline.cli load_mmlu_pro \
+    --base_model "$BASE_MODEL" \
+    --mmlu_pro_normalized_cache outputs/data/mmlu_pro_normalized.jsonl \
+    --mmlu_pro_splits "test" \
+    --mmlu_pro_max 500 \
+    --test_size 500 --train_size 0 --dev_size 0
+
+# Step 2 — evaluate the MedQA-trained manager on MMLU-Pro (zero-shot transfer)
+python -m src.pipeline.cli eval_manager_tools \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --mmlu_pro_normalized_cache outputs/data/mmlu_pro_normalized.jsonl \
+    --eval_n_samples 500 --test_size 500 \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
     --task_description "$TASK_DESC"
 
 # Results:
-#   outputs/eval/$TEACHER_ID/manager_tool_eval_report.json
-#   outputs/eval/$TEACHER_ID/manager_tool_eval.jsonl
+#   outputs/eval/$TEACHER_ID/manager_tool_eval_report.json  ← accuracy, avg_tool_calls
+#   outputs/eval/$TEACHER_ID/manager_tool_eval.jsonl        ← per-example detail
+```
+
+**What to look for in the results:**
+
+```python
+from src.utils.io import read_jsonl
+from src.manager.reward import compute_ece, compute_routing_entropy
+
+records = read_jsonl("outputs/eval/<teacher_id>/manager_tool_eval.jsonl")
+# eval_manager_tools logs correct/tool_calls per example — compute calibration metrics
+ece = compute_ece(records, p_high=0.9, p_low=0.2)
+ent = compute_routing_entropy(records)
+print(f"ECE = {ece['ece']:.3f}")
+print(f"Routing entropy (normalized) = {ent['normalized_entropy']:.3f}")
+# Expected: higher entropy than MedQA (10-option questions are harder)
+```
+
+> **If you want a per-category breakdown**, filter `records` by `task_subtype` (which contains the MMLU-Pro category name) before calling `compute_ece`.
+
+---
+
+## GPQA-Diamond: expert-level evaluation
+
+GPQA-Diamond has only 198 questions and is used as a hard-case evaluation only. The dataset is **gated on HuggingFace** — you must accept the terms and log in first.
+
+```bash
+# One-time setup
+huggingface-cli login
+# Accept terms at: https://huggingface.co/datasets/Idavidrein/gpqa
+```
+
+```bash
+export BASE_MODEL=Qwen/Qwen3-8B
+export TEACHER_ID=claude_sonnet_4_5       # reuse the MedQA-trained manager
+export TASK_DESC="You are a manager agent solving expert-level science multiple-choice questions."
+export PYTHONUTF8=1
+
+# Step 1 — download and cache GPQA-Diamond (all 198 examples)
+python -m src.pipeline.cli load_gpqa \
+    --base_model "$BASE_MODEL" \
+    --gpqa_subsets gpqa_diamond \
+    --gpqa_normalized_cache outputs/data/gpqa_diamond_normalized.jsonl \
+    --test_size 198 --train_size 0 --dev_size 0
+
+# Step 2 — evaluate on all 198 questions
+python -m src.pipeline.cli eval_manager_tools \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --gpqa_normalized_cache outputs/data/gpqa_diamond_normalized.jsonl \
+    --eval_n_samples 198 --test_size 198 \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
+    --task_description "$TASK_DESC"
+```
+
+**Expected behavior after CCR training:**
+- `avg_tool_calls` should be higher on GPQA-Diamond than on any training benchmark — the manager should have learned that expert-level questions require maximum consultation.
+- `routing entropy` should be close to 1.0 (maximum, normalized).
+- Accuracy will still be modest (GPQA-Diamond is designed to defeat LLMs), but the routing calibration story is the point.
+
+```bash
+# Optional: run all three subsets and compare routing entropy
+for SUBSET in gpqa_diamond gpqa_main gpqa_extended; do
+  python -m src.pipeline.cli load_gpqa \
+      --base_model "$BASE_MODEL" \
+      --gpqa_subsets "$SUBSET" \
+      --gpqa_normalized_cache "outputs/data/${SUBSET}_normalized.jsonl" \
+      --test_size 500 --train_size 0 --dev_size 0
+  python -m src.pipeline.cli eval_manager_tools \
+      --base_model "$BASE_MODEL" \
+      --teacher_id "$TEACHER_ID" \
+      --gpqa_normalized_cache "outputs/data/${SUBSET}_normalized.jsonl" \
+      --eval_n_samples 500 --test_size 500 \
+      --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
+      --task_description "$TASK_DESC"
+done
+# Diamond should show the highest routing entropy of the three.
 ```
 
 ---
 
 ## Notes on the cold-start step
 
-Cold-start (steps 5–6) is critical for full-parameter GRPO. Without it the manager
-never discovers native tool calls and GRPO only trains direct-answer behavior:
+Cold-start (the `manager_coldstart_sft` + `train_manager_sft` steps) is critical before GRPO. Without it the manager never discovers native tool calls:
 
 ```
 tools/call_frequency: 0
-reward: 0
+reward: 0 (or all-negative for CCR mode)
 frac_reward_zero_std: 1
 ```
 
-If you see those metrics after starting GRPO, the cold-start adapter was not
-loaded. Verify `--mgr_init_adapter` points to a directory containing
-`adapter_config.json` or a full model `config.json`.
+If you see those after starting GRPO, the cold-start adapter was not loaded. Verify `--mgr_init_adapter` points to a directory containing `adapter_config.json` (LoRA) or `config.json` (full model).
 
 ---
 
----
+## Comparing teachers
 
-## Comparing teachers (the actual experiment)
+Run the full MedQA pipeline three times with different teachers. The `--teacher_id` flag namespaces all outputs so runs never overwrite each other.
 
-Run the full pipeline three times with different teachers. The `--teacher_id` flag controls all output paths, so the three runs never overwrite each other.
+| teacher_id | provider | model |
+|---|---|---|
+| `claude_sonnet_4_5` | anthropic | `claude-sonnet-4-5` |
+| `gpt_4o` | openai | `gpt-4o-2024-08-06` |
+| `deepseek_v4` | deepseek | `deepseek-chat` |
 
-| teacher_id           | provider   | model                    |
-|----------------------|------------|--------------------------|
-| `claude_sonnet_4_5`  | anthropic  | `claude-sonnet-4-5`      |
-| `gpt_4o`             | openai     | `gpt-4o-2024-08-06`      |
-| `deepseek_v4`        | deepseek   | `deepseek-chat`          |
+**Three comparison layers:**
 
-After all three runs, the three layers of comparison are:
-
-**Layer 1 — synthesis quality** (cheapest signal, available before any training):
 ```bash
-# Per-attempt failure log shows how often each teacher hit each quality gate
+# Layer 1 — synthesis quality (before any training)
 ls outputs/sft_data/<teacher_id>/*_synth_log.jsonl
-ls outputs/sft_data/<teacher_id>/*.meta.json   # aggregate stats
-```
-Look for: `json_parse_fail`, `schema_fail`, `leakage_fail`, `balance_fail` rates. A high `leakage_fail` rate means the teacher keeps trying to disclose the answer — that teacher's subagent will likely be worse downstream.
+# Look for: json_parse_fail, schema_fail, leakage_fail rates
 
-**Layer 2 — subagent reliability** (after subagent SFT):
-```bash
+# Layer 2 — subagent reliability (after subagent SFT)
 cat outputs/eval/<teacher_id>/subagent_eval_report.json
-```
-Look for: `json_ok_rate` and `schema_ok_rate` per subagent. If they're below ~0.9 the subagent isn't reliable enough to be a tool.
+# Look for: json_ok_rate, schema_ok_rate per subagent (want > 0.9)
 
-**Layer 3 — manager accuracy** (final number):
-```bash
-cat outputs/eval/<teacher_id>/manager_eval_report.json
+# Layer 3 — manager accuracy + calibration (final)
+cat outputs/eval/<teacher_id>/manager_tool_eval_report.json
+# Look for: accuracy, avg_tool_calls, tool_call_rate
 ```
-This is the headline comparison. But the interesting story is usually in *how* the three teachers fail — pull `outputs/eval/<teacher_id>/manager_eval.jsonl` to see per-example predictions and routing patterns.
 
 ---
 
@@ -480,162 +548,107 @@ This is the headline comparison. But the interesting story is usually in *how* t
 ```
 outputs/
 ├── data/
-│   └── medqa_normalized.jsonl              # cached normalized MedQA
-├── teacher_cache/<teacher_slug>/           # disk cache for teacher API calls
-│   └── <hash>.json                         # avoids re-spending on re-runs
+│   ├── medqa_normalized.jsonl
+│   ├── legalbench_5tasks.jsonl
+│   ├── mmlu_pro_normalized.jsonl
+│   └── gpqa_diamond_normalized.jsonl
+├── teacher_cache/<teacher_slug>/           # disk-cached teacher API calls
 ├── sft_data/<teacher_slug>/
-│   ├── extractor_sft.jsonl                 # SFT input for the subagent trainer
-│   ├── extractor_sft.jsonl.meta.json       # synth stats (acceptance rates etc.)
+│   ├── extractor_sft.jsonl                 # SFT input (prompt + response pairs)
 │   ├── extractor_synth_log.jsonl           # per-attempt failure log
 │   ├── reasoner_sft.jsonl
-│   ├── reasoner_sft.jsonl.meta.json
-│   ├── reasoner_synth_log.jsonl
-│   ├── rule_applier_sft.jsonl
-│   ├── rule_applier_sft.jsonl.meta.json
-│   └── rule_applier_synth_log.jsonl
+│   └── rule_applier_sft.jsonl
 ├── adapters/<teacher_slug>/
-│   ├── extractor_adapter/                  # LoRA adapter
+│   ├── extractor_adapter/
 │   ├── reasoner_adapter/
 │   └── rule_applier_adapter/
 ├── manager/<teacher_slug>/
-│   ├── grpo/
-│   │   ├── (model checkpoints)
-│   │   ├── fail_buffer.jsonl               # GRPO failures, drives evolve
-│   │   ├── train_raw_trace.jsonl           # full per-completion trace
-│   │   └── manager_run_config.json
-│   ├── evolve/
-│   │   ├── manager_sft_from_failures.jsonl # multi-turn SFT trajectories
-│   │   └── evolve_run_config.json
-│   └── sft_evolved/                        # final manager (post-evolve SFT)
+│   ├── sft_coldstart/                      # cold-start adapter
+│   ├── grpo_ccr/
+│   │   ├── fail_buffer.jsonl               # GRPO failures → evolve input
+│   │   ├── train_raw_trace.jsonl           # per-completion trace (correct, tool_calls, implicit_confidence)
+│   │   └── manager_run_config.json         # includes ccr_mode, p_high, p_low
+│   └── evolve/
+│       └── manager_sft_from_failures.jsonl
 └── eval/<teacher_slug>/
-    ├── subagent_eval.jsonl                 # per-example subagent JSON output
-    ├── subagent_eval_report.json
-    ├── manager_eval.jsonl                  # per-example manager prediction
-    └── manager_eval_report.json
+    ├── manager_tool_eval_report.json       # accuracy, avg_tool_calls, calibration metrics
+    └── manager_tool_eval.jsonl
 ```
 
 ---
 
 ## Available CLI stages
 
-| stage                  | what it does                                                        |
-|------------------------|---------------------------------------------------------------------|
-| `load_medqa`           | Load + normalize MedQA from HF (or local), cache to disk            |
-| `synth_subagent`       | Generate SFT data for one subagent using the chosen teacher         |
-| `train_subagent`       | LoRA-SFT one subagent on its synthesized data                       |
-| `train_manager_grpo`   | GRPO-train the manager with three subagents as frozen tools         |
-| `evolve_build_sft`     | Read GRPO fail buffer, build per-turn manager SFT trajectories      |
-| `train_manager_sft`    | LoRA-SFT the manager on the evolve trajectories                     |
-| `evolve_round`         | Run all three (GRPO → evolve_build → manager_sft) in sequence       |
-| `eval_subagents`       | Score each subagent on JSON validity + schema validity              |
-| `eval_manager`         | Score manager final-answer accuracy on a sample                     |
+| Stage | What it does |
+|---|---|
+| `load_medqa` | Download and cache MedQA from HuggingFace |
+| `load_gpqa` | Download and cache GPQA subsets (gated — requires HF login) |
+| `load_mmlu_pro` | Download and cache MMLU-Pro |
+| `export_legalbench_jsonl` | Export LegalBench rows as DeepSeek-style prompt JSONL |
+| `synth_subagent` | Generate subagent SFT data via a teacher LLM |
+| `export_deepseek_jsonl` | Export synthesis prompts for local DeepSeek inference |
+| `import_deepseek_jsonl` | Import and validate local DeepSeek responses |
+| `train_subagent` | LoRA-SFT one subagent on its synthesised data |
+| `manager_coldstart_sft` | Build + train manager cold-start SFT from teacher demonstrations |
+| `train_manager_grpo` | GRPO-train the manager (supports `--mgr_ccr_mode`) |
+| `evolve_build_sft` | Build targeted SFT from GRPO fail buffer |
+| `train_manager_sft` | LoRA-SFT the manager on evolve or coldstart trajectories |
+| `evolve_round` | One full round: GRPO → evolve build → manager SFT |
+| `eval_subagents` | Score JSON validity and schema validity per subagent |
+| `eval_manager` | Score manager accuracy (no tools, greedy) |
+| `eval_manager_tools` | Score manager accuracy with the full tool-calling loop |
 
-Run `python -m src.pipeline.cli --help` for the full flag list.
-
----
-
-## Key design decisions worth knowing
-
-**1. Why three subagents instead of two**
-The previous PubMedQA-focused version had `reasoning_tool` + `context_tool`, which overlap. Splitting into `Extractor` (objective fact extraction) + `Reasoner` (structured multi-step reasoning) + `RuleApplier` (rule/criterion application) makes the routing decision meaningful. On MedQA specifically, Reasoner is the workhorse because MedQA is closed-book MCQ, but the design generalizes to PubMedQA / LegalBench / GPQA without changes to the schemas.
-
-**2. GT visibility per subagent**
-- **Extractor** — GT is hidden from the teacher. Reason: extraction is supposed to be objective; showing GT biases the teacher to only surface evidence supporting the right answer, which teaches the subagent to skip reasonable counter-evidence.
-- **Reasoner & RuleApplier** — GT is shown to the teacher (as `PRIVATE_GT`), but the prompt forbids disclosure and the leakage auditor scans every output. Reason: these tasks are hard enough that letting the teacher solve from scratch produces too many wrong samples; reverse-construction from a known answer is more reliable.
-
-**3. Four quality gates at synthesis time**
-Every teacher response must pass:
-1. JSON-parseable
-2. Pydantic schema validation (matches the subagent's output schema)
-3. Balance check (Reasoner only — `candidate_analysis` must cover all choice keys)
-4. Leakage audit (no GT label, GT choice text, or `ANSWER_X` form anywhere in the output)
-
-Failures are retried up to 2× with bumped temperature, then dropped. All failures are logged to `<kind>_synth_log.jsonl`.
-
-**4. Teacher API call caching**
-Teacher responses are cached on disk by `(provider, model, messages, temperature)` hash. Re-running the synthesize stage on the same teacher costs $0 for already-seen prompts. Useful when iterating on the schema or quality gates.
-
-**5. Manager tool binding modes**
-TRL's GRPO trainer supports two ways to bind tools to the current example:
-- `environment` mode: tools have no `example_id` argument; an `Environment.reset(example_id)` call binds them. Preferred — eliminates manager hallucinating example IDs.
-- `argument` mode: tools take `example_id` as an explicit arg, manager must pass it from the user message.
-
-The CLI defaults to `auto`, which picks `environment` if your TRL version supports it. Older TRL versions fall back to `argument`. Both work.
-
-**6. Evolve loop logic**
-After GRPO, the `fail_buffer.jsonl` contains every failed example. Evolve does:
-1. Read failures → unique example IDs
-2. For each failed example: ask teacher to choose a tool sequence (0–3 tools), without showing GT
-3. Pre-fetch tool outputs for the chosen sequence
-4. Construct multi-turn SFT trajectories: `[user_msg → tool_call_1 → tool_output_1 → tool_call_2 → ... → final ANSWER_<token>]`, split into per-turn `(prompt, response)` pairs
-5. SFT-train manager on these trajectories at a low LR (2e-5)
-
-The final answer is constructed from GT (teacher forcing). The teacher only chooses *the routing*, not the answer.
+Run `python -m src.pipeline.cli --help` for all flags.
 
 ---
 
-## Caveats
+## Key design decisions
 
-**Qwen3-0.6B is for pipeline validation, not production results.**
-0.6B is enough to verify the full loop runs and to do the teacher comparison (relative differences between teachers should still surface), but absolute manager accuracy on MedQA will be modest. The full routing dynamic — manager learning when *not* to call tools, learning to combine evidence from multiple tools — only emerges with bigger base models. Set `--base_model Qwen/Qwen3-8B` (or larger) for serious runs; the code is base-model-agnostic.
+**Why frozen subagents?**
+In MAS literature (Stronger-MAS, MetaAgent-X), all agents are trained jointly. Here, subagents are frozen by design: we want to study the routing decision in isolation, not how to train the experts. This is the "consultation" paradigm rather than "collaboration" — the manager consults frozen specialists and takes sole responsibility for the answer.
 
-**The leakage auditor is intentionally strict.**
-If you see lots of `leakage_fail` in synth logs (>20% rate), check `outputs/sft_data/<teacher_id>/<kind>_synth_log.jsonl` to see what's tripping it. Most legitimate hits are the teacher writing things like "this option is correct" in `candidate_analysis`. Don't relax the auditor without first verifying the matches are false positives — leakage at SFT time gets baked into the subagent and silently degrades manager accuracy at inference time.
+**Why CCR instead of binary reward?**
+Binary reward (0/1) treats "confident and wrong" the same as "uncertain and wrong." CCR makes overconfidence explicitly more costly: a manager that calls 0 tools and gets it wrong receives the worst possible reward, while a manager that called all 3 tools and still got it wrong receives a mild penalty (it was appropriately uncertain). This asymmetry is exactly what the logarithmic scoring rule guarantees.
 
-**Subagents are loaded onto the same GPU as the manager.**
-Three frozen 0.6B subagents + one training 0.6B manager fits comfortably in 24GB. For 7B+ base models you'll need either gradient checkpointing + 80GB cards, or device sharding (not implemented here).
+**Why multiple SFT steps?**
+Each SFT step solves a different problem:
+- **Subagent SFT**: bootstraps specialist knowledge from a teacher model
+- **Cold-start SFT**: teaches the manager the tool-calling interface before RL exploration
+- **Evolve SFT**: targeted recovery on hard cases that RL cannot reach efficiently
 
-**The `eval_manager` stage uses simple greedy generation, not real tool-calling rollouts.**
-This measures the manager's accuracy when forced to answer without tools — it's a useful baseline but doesn't reflect the trained tool-using behavior. For tool-aware eval, you currently need to re-use the GRPO rollout machinery (a TODO).
+None of these steps teach calibration — that is the exclusive role of CCR-GRPO.
 
----
+**GT visibility per subagent**
+- **Extractor** — GT hidden from teacher. Extraction should be objective; showing GT biases the teacher to omit counter-evidence.
+- **Reasoner / RuleApplier** — GT shown as `PRIVATE_GT` but disclosure is forbidden and audited. These tasks are hard enough that reverse-construction from a known answer is more reliable than unconstrained teacher generation.
 
-## Extending to other benchmarks
-
-The schemas, prompts, and training code are benchmark-agnostic. To add PubMedQA / GPQA / LegalBench / LawBench:
-
-1. Add a loader in `src/benchmarks/<name>.py` following `medqa.py`'s shape — must produce `StandardRow` objects.
-2. Export it from `src/benchmarks/__init__.py`.
-3. Add a `--benchmark` flag in `pipeline/cli.py` and route to the right loader.
-4. Use `--task_description` to give the manager an appropriate domain prompt ("You are answering legal reasoning questions.", etc.).
-
-The three subagents map cleanly to the other benchmarks:
-- **PubMedQA / LegalBench / LawBench** — Extractor becomes more central (long context to mine).
-- **GPQA** — Reasoner stays central; RuleApplier handles formula/principle application.
-- **LegalBench / LawBench** — RuleApplier becomes central (statute/doctrine application).
+**Four synthesis quality gates**
+Every teacher response must pass: JSON-parseable → Pydantic schema valid → balance check (Reasoner only, all choices covered) → leakage audit (no GT label in output). Failures are retried up to 2× with bumped temperature, then dropped and logged to `<kind>_synth_log.jsonl`.
 
 ---
 
 ## Troubleshooting
 
-**"trl ... environment_factory not supported"**
-Upgrade TRL: `pip install -U trl`. Or run with `--binding_mode argument`.
+**`huggingface-cli login` fails for GPQA**
+GPQA requires explicitly accepting terms at `https://huggingface.co/datasets/Idavidrein/gpqa`. Log in on the web first, accept the form, then `huggingface-cli login` with a token that has `read` permission.
 
-**`leakage_fail` rate is very high for one teacher**
-That teacher is consistently disclosing answers despite the prompt. You can:
-- Try a stricter system prompt for that teacher (edit `src/subagents/prompts/`).
-- Lower `--synth_temperature` to make the teacher less creative.
-- Use a different model from that provider (e.g. switch GPT-4o → GPT-4-turbo).
-This is itself a finding for the teacher comparison.
+**MMLU-Pro `validation` split is only 70 rows**
+This is expected. The MMLU-Pro `test` split (~12k rows) contains ground-truth answers and is what the paper community evaluates on. We load from `test` by default; pass `--mmlu_pro_splits test` explicitly.
 
-**Subagent eval shows `schema_ok_rate < 0.7`**
-The subagent didn't internalize the schema. Likely causes:
-- Not enough SFT epochs — try `--sft_epochs 5`.
-- Synth data is too noisy (check synth logs).
-- Base model is too small — schema following improves dramatically with size.
+**GRPO `tools/call_frequency = 0` from the start**
+Cold-start adapter not loaded. See the "Notes on the cold-start step" section.
 
-**Manager GRPO loss is flat / reward never improves**
-Some debugging steps:
-- Check `fail_buffer.jsonl` — is the manager always emitting the wrong format? If so, do a small manager SFT on a few hand-crafted format examples first.
-- Lower `--mgr_temperature` from 0.9 to 0.7.
-- Increase `--mgr_num_generations` from 6 to 8 (more group diversity for GRPO advantage).
-- Check the `train_raw_trace.jsonl` — what is the manager actually outputting?
+**CCR rewards are all negative**
+This is expected — log scoring rule rewards are always negative. GRPO normalises within group, so the absolute scale is irrelevant. What matters is the relative ordering within each group.
 
-**Out of memory during GRPO**
-- Lower `--mgr_bs` to 1.
-- Lower `--mgr_num_generations` to 4.
-- Lower `--mgr_max_completion_length` to 1024.
-- Last resort: switch subagents to CPU inference (slow but functional).
+**`leakage_fail` rate > 20%**
+The teacher keeps disclosing the answer. Check `<kind>_synth_log.jsonl` to see the actual matches. Try lowering `--synth_temperature` or switching to a stricter teacher model.
+
+**`schema_ok_rate < 0.7`**
+Subagent didn't internalise the schema. Try `--sft_epochs 5` or increase `--n_samples`.
+
+**OOM during GRPO**
+Lower `--mgr_bs` to 1, `--mgr_num_generations` to 4, `--mgr_max_completion_length` to 1024. For 8B models, use the multi-GPU setup with a vLLM server.
 
 ---
 

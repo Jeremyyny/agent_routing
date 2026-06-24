@@ -19,8 +19,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..benchmarks.base import StandardRow
+from ..benchmarks.gpqa import load_gpqa
 from ..benchmarks.legalbench import load_legalbench
 from ..benchmarks.medqa import load_medqa
+from ..benchmarks.mmlu_pro import load_mmlu_pro
 from ..manager.prompt import (
     build_manager_system_prompt,
     build_manager_user_message,
@@ -207,6 +209,56 @@ def run_load_legalbench(
         write_jsonl(cache_normalized_path, [r.to_dict() for r in rows])
         write_json(cache_normalized_path + ".meta.json", meta)
         print(f"[LOAD_LEGALBENCH] cached normalized rows -> {cache_normalized_path}")
+    return rows
+
+
+# --------------------- Stage: GPQA loading ---------------------
+
+def run_load_gpqa(
+    dataset_name: str = "Idavidrein/gpqa",
+    subsets: str = "gpqa_diamond",
+    hf_cache_dir: Optional[str] = None,
+    max_examples: int = 0,
+    answer_seed: int = 42,
+    cache_normalized_path: Optional[str] = None,
+) -> List[StandardRow]:
+    rows = load_gpqa(
+        dataset_name=dataset_name,
+        subsets=subsets,
+        hf_cache_dir=hf_cache_dir,
+        max_examples=max_examples,
+        answer_seed=answer_seed,
+    )
+    print(f"[LOAD_GPQA] loaded {len(rows)} rows  subsets={subsets}")
+    if cache_normalized_path:
+        write_jsonl(cache_normalized_path, [r.to_dict() for r in rows])
+        print(f"[LOAD_GPQA] cached normalized rows -> {cache_normalized_path}")
+    return rows
+
+
+# --------------------- Stage: MMLU-Pro loading ---------------------
+
+def run_load_mmlu_pro(
+    dataset_name: str = "TIGER-Lab/MMLU-Pro",
+    categories: str = "",
+    hf_cache_dir: Optional[str] = None,
+    max_examples: int = 0,
+    splits: str = "test,validation",
+    cache_normalized_path: Optional[str] = None,
+) -> List[StandardRow]:
+    split_list = [s.strip() for s in splits.split(",") if s.strip()]
+    rows = load_mmlu_pro(
+        dataset_name=dataset_name,
+        categories=categories,
+        hf_cache_dir=hf_cache_dir,
+        max_examples=max_examples,
+        splits=split_list,
+    )
+    cat_desc = categories or "all"
+    print(f"[LOAD_MMLU_PRO] loaded {len(rows)} rows  categories={cat_desc}")
+    if cache_normalized_path:
+        write_jsonl(cache_normalized_path, [r.to_dict() for r in rows])
+        print(f"[LOAD_MMLU_PRO] cached normalized rows -> {cache_normalized_path}")
     return rows
 
 
@@ -527,6 +579,10 @@ def run_train_manager_grpo(
     grpo_beta: float = 0.01,
     routing_efficiency_bonus: float = 0.0,
     tool_use_bonus: float = 0.0,
+    ccr_mode: bool = False,
+    ccr_p_high: float = 0.9,
+    ccr_p_low: float = 0.2,
+    ccr_k_max: int = 3,
     full_parameter_rl: bool = False,
     max_steps: int = -1,
     output_dir: Optional[str] = None,
@@ -559,6 +615,10 @@ def run_train_manager_grpo(
         max_steps=max_steps,
         routing_efficiency_bonus=routing_efficiency_bonus,
         tool_use_bonus=tool_use_bonus,
+        ccr_mode=ccr_mode,
+        ccr_p_high=ccr_p_high,
+        ccr_p_low=ccr_p_low,
+        ccr_k_max=ccr_k_max,
         full_parameter_rl=full_parameter_rl,
         binding_mode=ctx.binding_mode,
         use_wandb=use_wandb,

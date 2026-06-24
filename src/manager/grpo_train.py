@@ -195,6 +195,10 @@ class ManagerGRPOConfig:
     max_steps: int = -1
     routing_efficiency_bonus: float = 0.0
     tool_use_bonus: float = 0.0
+    ccr_mode: bool = False               # if true, use log-scoring-rule CCR reward instead of binary
+    ccr_p_high: float = 0.9             # CCR implicit confidence when 0 tools called
+    ccr_p_low: float = 0.2              # CCR implicit confidence when ccr_k_max tools called
+    ccr_k_max: int = 3                  # must match max_tool_calling_iterations
     full_parameter_rl: bool = False      # if true, merge init adapter and train all model weights
     binding_mode: str = "auto"           # auto | environment | argument
     subagent_server_url: Optional[str] = None  # if set, call subagents via vLLM HTTP (no local model load)
@@ -397,8 +401,23 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         raw_trace_jsonl=raw_trace,
         routing_efficiency_bonus=cfg.routing_efficiency_bonus,
         tool_use_bonus=cfg.tool_use_bonus,
+        ccr_mode=cfg.ccr_mode,
+        ccr_p_high=cfg.ccr_p_high,
+        ccr_p_low=cfg.ccr_p_low,
+        ccr_k_max=cfg.ccr_k_max,
         is_main_process=is_main,
     )
+    if cfg.ccr_mode:
+        print(
+            f"[MANAGER_GRPO] CCR mode ON  p_high={cfg.ccr_p_high} "
+            f"p_low={cfg.ccr_p_low} k_max={cfg.ccr_k_max}"
+        )
+    else:
+        print(
+            f"[MANAGER_GRPO] binary reward  "
+            f"routing_efficiency_bonus={cfg.routing_efficiency_bonus} "
+            f"tool_use_bonus={cfg.tool_use_bonus}"
+        )
 
     if binding_mode == "environment":
         trainer = GRPOTrainer(
@@ -440,5 +459,9 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         "subagent_server_url": cfg.subagent_server_url or "",
         "routing_efficiency_bonus": cfg.routing_efficiency_bonus,
         "tool_use_bonus": cfg.tool_use_bonus,
+        "ccr_mode": bool(cfg.ccr_mode),
+        "ccr_p_high": float(cfg.ccr_p_high),
+        "ccr_p_low": float(cfg.ccr_p_low),
+        "ccr_k_max": int(cfg.ccr_k_max),
     })
     print(f"[MANAGER_GRPO] saved -> {cfg.out_dir}")
