@@ -53,18 +53,20 @@ Each benchmark follows the same split structure. The numbers below are the recom
 
 ### Why these numbers
 
-| Pool | MedQA | LegalBench (5 tasks) | MMLU-Pro | GPQA-Diamond |
-|---|---|---|---|---|
-| Total available | ~12 k | ~800–1 500 | ~12 k test | 198 |
-| Subagent SFT (per agent) | **500** | **150** | eval only | eval only |
-| Manager cold-start SFT | **300** | **80** | eval only | eval only |
-| Manager GRPO train | **600** | **200** | eval only | eval only |
-| Dev (sanity check) | 200 | 100 | — | — |
-| **Test / Eval** | **500** | **100** | **500** | **198 (all)** |
+| Pool | MedQA | LegalBench (5 tasks) | MMLU-Pro | GPQA-Main | GPQA-Extended | GPQA-Diamond |
+|---|---|---|---|---|---|---|
+| Total available | ~12 k | ~800–1 500 | ~12 k test | 448 | 546 | 198 |
+| Subagent SFT (per agent) | **500** | **150** | eval only | **100** | **130** | eval only |
+| Manager cold-start SFT | **300** | **80** | eval only | **60** | **80** | eval only |
+| Manager GRPO train | **600** | **200** | eval only | **88** | **136** | eval only |
+| Dev (sanity check) | 200 | 100 | — | 100 | 100 | — |
+| **Test / Eval** | **500** | **100** | **500** | **100** | **100** | **198 (all)** |
 
 **MMLU-Pro** — The community uses the full `test` split for comparison with other papers; training on any part of it breaks comparability. Use it as a zero-shot generalisation probe only.
 
-**GPQA-Diamond** — Only 198 questions exist; too small and too domain-specific for training. Use all 198 as a hard-case evaluation.
+**GPQA-Diamond** — Only 198 questions; too small to train. Use all 198 as a hard-case probe of a manager trained on GPQA-Main/Extended or another benchmark.
+
+**GPQA-Main / Extended** — Large enough for a full pipeline. Extended gives ~50 more GRPO training rows over Main.
 
 > **Paper claim enabled by this split**: "A routing policy trained on domain X generalises to domains Y and Z without retraining." MedQA/LegalBench train routing; MMLU-Pro/GPQA test whether calibrated uncertainty is domain-agnostic.
 
@@ -442,9 +444,9 @@ print(f"Routing entropy (normalized) = {ent['normalized_entropy']:.3f}")
 
 ---
 
-## GPQA-Diamond: expert-level evaluation
+## GPQA: expert-level science questions
 
-GPQA-Diamond has only 198 questions and is used as a hard-case evaluation only. The dataset is **gated on HuggingFace** — you must accept the terms and log in first.
+GPQA has three subsets of increasing size. The dataset is **gated on HuggingFace** — accept the terms and log in once before any of the commands below.
 
 ```bash
 # One-time setup
@@ -452,20 +454,135 @@ huggingface-cli login
 # Accept terms at: https://huggingface.co/datasets/Idavidrein/gpqa
 ```
 
+| Subset | Questions | Recommended use |
+|---|---|---|
+| `gpqa_diamond` | 198 | Eval only (too small to train) |
+| `gpqa_main` | 448 | Full pipeline (train + eval) |
+| `gpqa_extended` | 546 | Full pipeline (more training data) |
+
+`gpqa_diamond ⊆ gpqa_main ⊆ gpqa_extended` — each larger set contains the previous one.
+
+---
+
+### GPQA-Main / Extended: full end-to-end pipeline
+
 ```bash
 export BASE_MODEL=Qwen/Qwen3-8B
-export TEACHER_ID=claude_sonnet_4_5       # reuse the MedQA-trained manager
-export TASK_DESC="You are a manager agent solving expert-level science multiple-choice questions."
+export TEACHER_ID=gpqa_claude
+export PROVIDER=anthropic
+export MODEL=claude-sonnet-4-5
+export TASK_DESC="You are a manager agent solving expert-level graduate science multiple-choice questions."
 export PYTHONUTF8=1
 
-# Step 1 — download and cache GPQA-Diamond (all 198 examples)
+# Use gpqa_main (448 q) — swap to gpqa_extended (546 q) for more training data
+export GPQA_SUBSET=gpqa_main
+export GPQA_CACHE=outputs/data/gpqa_main_normalized.jsonl
+
+# Step 1 — download and cache
+python -m src.pipeline.cli load_gpqa \
+    --base_model "$BASE_MODEL" \
+    --gpqa_subsets "$GPQA_SUBSET" \
+    --gpqa_normalized_cache "$GPQA_CACHE" \
+    --train_size 248 --dev_size 100 --test_size 100
+
+# Step 2 — synthesize subagent SFT data (100 examples each, from train pool)
+for KIND in extractor reasoner rule_applier; do
+  python -m src.pipeline.cli synth_subagent \
+      --base_model "$BASE_MODEL" \
+      --teacher_id "$TEACHER_ID" \
+      --teacher_provider "$PROVIDER" --teacher_model "$MODEL" \
+      --agent_kind "$KIND" --n_samples 100 \
+      --gpqa_normalized_cache "$GPQA_CACHE" \
+      --train_size 248 --dev_size 100 --test_size 100 \
+      --task_description "$TASK_DESC"
+done
+
+# Step 3 — SFT the three subagents
+for KIND in extractor reasoner rule_applier; do
+  python -m src.pipeline.cli train_subagent \
+      --base_model "$BASE_MODEL" \
+      --teacher_id "$TEACHER_ID" --agent_kind "$KIND" \
+      --sft_epochs 3 --sft_lr 2e-4
+done
+
+# Step 4 — validate subagents
+python -m src.pipeline.cli eval_subagents \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --gpqa_normalized_cache "$GPQA_CACHE" \
+    --eval_n_samples 30
+
+# Step 5 — manager cold-start (60 examples, non-overlapping with SFT data)
+python -m src.pipeline.cli manager_coldstart_sft \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --gpqa_normalized_cache "$GPQA_CACHE" \
+    --train_size 248 --dev_size 100 --test_size 100 \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --coldstart_n_samples 60 \
+    --task_description "$TASK_DESC"
+
+python -m src.pipeline.cli train_manager_sft \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --manager_sft_train_jsonl "outputs/manager/${TEACHER_ID}/evolve/manager_sft_coldstart.jsonl" \
+    --manager_sft_epochs 1 --manager_sft_lr 2e-5
+
+# Step 6 — GRPO with CCR (remaining ~88 train rows after SFT pools excluded)
+bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
+    --base_model "$BASE_MODEL" \
+    --gpqa_normalized_cache "$GPQA_CACHE" \
+    --train_size 248 --dev_size 100 --test_size 100 \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_coldstart" \
+    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
+    --mgr_ccr_mode --mgr_ccr_p_high 0.9 --mgr_ccr_p_low 0.2 \
+    --mgr_bs 2 --mgr_num_generations 6 \
+    --mgr_max_steps 80 \
+    --mgr_use_wandb --wandb_project agent_routing \
+    --wandb_run_name "${TEACHER_ID}_${GPQA_SUBSET}_ccr" \
+    --task_description "$TASK_DESC"
+
+# Step 7 — evaluate on 100-example held-out test set
+python -m src.pipeline.cli eval_manager_tools \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --gpqa_normalized_cache "$GPQA_CACHE" \
+    --eval_n_samples 100 --test_size 100 \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
+    --task_description "$TASK_DESC"
+```
+
+**For gpqa_extended (546 questions)** — just change the two export lines:
+```bash
+export GPQA_SUBSET=gpqa_extended
+export GPQA_CACHE=outputs/data/gpqa_extended_normalized.jsonl
+# Increase train_size to 346; everything else stays the same
+```
+
+---
+
+### GPQA-Diamond: eval only
+
+Diamond has only 198 questions — use it as a hard-case probe of an already-trained manager (e.g., one trained on GPQA-Main or MedQA).
+
+```bash
+export BASE_MODEL=Qwen/Qwen3-8B
+export TEACHER_ID=gpqa_claude        # or any trained manager
+export TASK_DESC="You are a manager agent solving expert-level science multiple-choice questions."
+
+# Cache all 198 questions
 python -m src.pipeline.cli load_gpqa \
     --base_model "$BASE_MODEL" \
     --gpqa_subsets gpqa_diamond \
     --gpqa_normalized_cache outputs/data/gpqa_diamond_normalized.jsonl \
     --test_size 198 --train_size 0 --dev_size 0
 
-# Step 2 — evaluate on all 198 questions
+# Evaluate
 python -m src.pipeline.cli eval_manager_tools \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
@@ -476,27 +593,28 @@ python -m src.pipeline.cli eval_manager_tools \
 ```
 
 **Expected behavior after CCR training:**
-- `avg_tool_calls` should be higher on GPQA-Diamond than on any training benchmark — the manager should have learned that expert-level questions require maximum consultation.
-- `routing entropy` should be close to 1.0 (maximum, normalized).
-- Accuracy will still be modest (GPQA-Diamond is designed to defeat LLMs), but the routing calibration story is the point.
+- `avg_tool_calls` highest of all benchmarks — the manager should request maximum consultation on Diamond.
+- `routing entropy` (normalized) close to 1.0.
+- Accuracy will be modest; the calibration story is the point.
+
+**Compare all three subsets** to validate that routing entropy tracks question difficulty:
 
 ```bash
-# Optional: run all three subsets and compare routing entropy
-for SUBSET in gpqa_diamond gpqa_main gpqa_extended; do
+for SUBSET in gpqa_main gpqa_extended gpqa_diamond; do
   python -m src.pipeline.cli load_gpqa \
       --base_model "$BASE_MODEL" \
       --gpqa_subsets "$SUBSET" \
       --gpqa_normalized_cache "outputs/data/${SUBSET}_normalized.jsonl" \
-      --test_size 500 --train_size 0 --dev_size 0
+      --test_size 198 --train_size 0 --dev_size 0
   python -m src.pipeline.cli eval_manager_tools \
       --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" \
       --gpqa_normalized_cache "outputs/data/${SUBSET}_normalized.jsonl" \
-      --eval_n_samples 500 --test_size 500 \
+      --eval_n_samples 198 --test_size 198 \
       --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
       --task_description "$TASK_DESC"
 done
-# Diamond should show the highest routing entropy of the three.
+# Expected: Diamond routing entropy > Extended > Main
 ```
 
 ---
