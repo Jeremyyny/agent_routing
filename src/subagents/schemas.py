@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 class AgentKind(str, Enum):
     EXTRACTOR = "extractor"
     REASONER = "reasoner"
-    RULE_APPLIER = "rule_applier"
+    VERIFIER = "verifier"
 
 
 # ---------- Extractor ----------
@@ -89,40 +89,40 @@ class ReasonerOutput(BaseModel):
         return [str(s)[:220].strip() for s in v if str(s).strip()]
 
 
-# ---------- Rule Applier ----------
+# ---------- Verifier ----------
 
-class ApplicableRule(BaseModel):
-    rule: str = Field(..., max_length=300)
+class RelevantPrinciple(BaseModel):
+    principle: str = Field(..., max_length=200)
     source: str = Field(default="", max_length=120)
 
 
-class RuleElement(BaseModel):
-    element: str = Field(..., max_length=240)
-    satisfied: str = Field(..., description="yes | no | unclear")
-    evidence: str = Field(default="", max_length=240)
+class VerifierCheck(BaseModel):
+    check: str = Field(..., max_length=200)
+    status: str = Field(..., description="pass | fail | unclear")
+    note: str = Field(default="", max_length=200)
 
-    @field_validator("satisfied")
+    @field_validator("status")
     @classmethod
-    def _check_sat(cls, v: str) -> str:
+    def _check_status(cls, v: str) -> str:
         v = (v or "").strip().lower()
-        return v if v in {"yes", "no", "unclear"} else "unclear"
+        return v if v in {"pass", "fail", "unclear"} else "unclear"
 
 
-class RuleApplierOutput(BaseModel):
-    applicable_rules: List[ApplicableRule] = Field(default_factory=list, max_length=6)
-    elements: List[RuleElement] = Field(default_factory=list, max_length=10)
-    conclusion_logic: str = Field(default="", max_length=400)
+class VerifierOutput(BaseModel):
+    relevant_principles: List[RelevantPrinciple] = Field(default_factory=list, max_length=6)
+    checks: List[VerifierCheck] = Field(default_factory=list, max_length=8)
+    potential_errors: List[str] = Field(default_factory=list, max_length=4)
     uncertainty_notes: List[str] = Field(default_factory=list, max_length=4)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
-    @field_validator("uncertainty_notes")
+    @field_validator("potential_errors", "uncertainty_notes")
     @classmethod
     def _trim(cls, v: List[str]) -> List[str]:
-        return [str(s)[:240].strip() for s in v if str(s).strip()]
+        return [str(s)[:200].strip() for s in v if str(s).strip()]
 
 
 SCHEMA_REGISTRY = {
     AgentKind.EXTRACTOR: ExtractorOutput,
     AgentKind.REASONER: ReasonerOutput,
-    AgentKind.RULE_APPLIER: RuleApplierOutput,
+    AgentKind.VERIFIER: VerifierOutput,
 }

@@ -1,6 +1,6 @@
 # Agent Routing — Metacognitive Routing with Calibrated Confidence
 
-A pipeline for training a manager LLM that learns **when to consult which specialized expert**. The manager decides whether to call 0–3 frozen subagents (extractor / reasoner / rule_applier) before answering a multiple-choice question. Routing is trained with GRPO using a **Calibrated Confidence Routing (CCR)** reward derived from the logarithmic scoring rule — the manager is rewarded not just for being correct but for expressing calibrated uncertainty through its routing choices.
+A pipeline for training a manager LLM that learns **when to consult which specialized expert**. The manager decides whether to call 0–3 frozen subagents (extractor / reasoner / verifier) before answering a multiple-choice question. Routing is trained with GRPO using a **Calibrated Confidence Routing (CCR)** reward derived from the logarithmic scoring rule — the manager is rewarded not just for being correct but for expressing calibrated uncertainty through its routing choices.
 
 Benchmarks supported: **MedQA-USMLE**, **LegalBench**, **MMLU-Pro**, **GPQA**.
 
@@ -13,7 +13,7 @@ Benchmarks supported: **MedQA-USMLE**, **LegalBench**, **MMLU-Pro**, **GPQA**.
               ┌─────────────┘    │       └──────────────┐
               ▼                  ▼                      ▼
    ┌──────────────────┐ ┌─────────────────┐ ┌──────────────────────┐
-   │  ExtractorAgent  │ │  ReasonerAgent  │ │  RuleApplierAgent    │
+   │  ExtractorAgent  │ │  ReasonerAgent  │ │  VerifierAgent       │
    │  (frozen, LoRA)  │ │ (frozen, LoRA)  │ │  (frozen, LoRA)      │
    └──────────────────┘ └─────────────────┘ └──────────────────────┘
             │                    │                     │
@@ -178,7 +178,7 @@ bash scripts/start_subagent_server.sh Qwen/Qwen3-8B <teacher_id>
 Verify:
 ```bash
 curl http://localhost:8000/health       # → {"status":"ok"}
-curl http://localhost:8000/v1/models | python -m json.tool  # lists extractor, reasoner, rule_applier
+curl http://localhost:8000/v1/models | python -m json.tool  # lists extractor, reasoner, verifier
 ```
 
 ### Step 2: run GRPO on GPUs 1-2-3
@@ -221,7 +221,7 @@ python -m src.pipeline.cli load_medqa \
     --train_size 1400 --dev_size 200 --test_size 500
 
 # Step 2 — synthesize subagent SFT data (500 examples each)
-for KIND in extractor reasoner rule_applier; do
+for KIND in extractor reasoner verifier; do
   python -m src.pipeline.cli synth_subagent \
       --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" \
@@ -233,7 +233,7 @@ for KIND in extractor reasoner rule_applier; do
 done
 
 # Step 3 — SFT-train the three subagents
-for KIND in extractor reasoner rule_applier; do
+for KIND in extractor reasoner verifier; do
   python -m src.pipeline.cli train_subagent \
       --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" --agent_kind "$KIND" \
@@ -255,7 +255,7 @@ python -m src.pipeline.cli manager_coldstart_sft \
     --train_size 1400 --dev_size 200 --test_size 500 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
-    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl" \
     --coldstart_n_samples 300 \
     --task_description "$TASK_DESC"
 
@@ -274,7 +274,7 @@ bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
     --train_size 600 --dev_size 200 --test_size 500 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
-    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl" \
     --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_coldstart" \
     --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
     --mgr_ccr_mode --mgr_ccr_p_high 0.9 --mgr_ccr_p_low 0.2 \
@@ -313,7 +313,7 @@ export PYTHONUTF8=1
 # Rows are loaded on-demand; pass --legalbench_normalized_cache to persist them.
 
 # Step 2 — synthesize subagent SFT data (150 examples each)
-for KIND in extractor reasoner rule_applier; do
+for KIND in extractor reasoner verifier; do
   python -m src.pipeline.cli synth_subagent \
       --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" \
@@ -328,7 +328,7 @@ done
 # After first run drop --legalbench_refresh_cache to reuse the cached file.
 
 # Step 3 — SFT subagents
-for KIND in extractor reasoner rule_applier; do
+for KIND in extractor reasoner verifier; do
   python -m src.pipeline.cli train_subagent \
       --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" --agent_kind "$KIND" \
@@ -352,7 +352,7 @@ python -m src.pipeline.cli manager_coldstart_sft \
     --train_size 530 --dev_size 100 --test_size 100 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
-    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl" \
     --coldstart_n_samples 80 \
     --task_description "$TASK_DESC"
 
@@ -370,7 +370,7 @@ bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
     --train_size 200 --dev_size 100 --test_size 100 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
-    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl" \
     --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_coldstart" \
     --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
     --mgr_ccr_mode --mgr_ccr_p_high 0.9 --mgr_ccr_p_low 0.2 \
@@ -486,7 +486,7 @@ python -m src.pipeline.cli load_gpqa \
     --train_size 248 --dev_size 100 --test_size 100
 
 # Step 2 — synthesize subagent SFT data (100 examples each, from train pool)
-for KIND in extractor reasoner rule_applier; do
+for KIND in extractor reasoner verifier; do
   python -m src.pipeline.cli synth_subagent \
       --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" \
@@ -498,7 +498,7 @@ for KIND in extractor reasoner rule_applier; do
 done
 
 # Step 3 — SFT the three subagents
-for KIND in extractor reasoner rule_applier; do
+for KIND in extractor reasoner verifier; do
   python -m src.pipeline.cli train_subagent \
       --base_model "$BASE_MODEL" \
       --teacher_id "$TEACHER_ID" --agent_kind "$KIND" \
@@ -520,7 +520,7 @@ python -m src.pipeline.cli manager_coldstart_sft \
     --train_size 248 --dev_size 100 --test_size 100 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
-    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl" \
     --coldstart_n_samples 60 \
     --task_description "$TASK_DESC"
 
@@ -537,7 +537,7 @@ bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
     --train_size 248 --dev_size 100 --test_size 100 \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
     --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
-    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/rule_applier_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl" \
     --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_coldstart" \
     --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
     --mgr_ccr_mode --mgr_ccr_p_high 0.9 --mgr_ccr_p_low 0.2 \
@@ -675,11 +675,11 @@ outputs/
 │   ├── extractor_sft.jsonl                 # SFT input (prompt + response pairs)
 │   ├── extractor_synth_log.jsonl           # per-attempt failure log
 │   ├── reasoner_sft.jsonl
-│   └── rule_applier_sft.jsonl
+│   └── verifier_sft.jsonl
 ├── adapters/<teacher_slug>/
 │   ├── extractor_adapter/
 │   ├── reasoner_adapter/
-│   └── rule_applier_adapter/
+│   └── verifier_adapter/
 ├── manager/<teacher_slug>/
 │   ├── sft_coldstart/                      # cold-start adapter
 │   ├── grpo_ccr/
@@ -738,7 +738,7 @@ None of these steps teach calibration — that is the exclusive role of CCR-GRPO
 
 **GT visibility per subagent**
 - **Extractor** — GT hidden from teacher. Extraction should be objective; showing GT biases the teacher to omit counter-evidence.
-- **Reasoner / RuleApplier** — GT shown as `PRIVATE_GT` but disclosure is forbidden and audited. These tasks are hard enough that reverse-construction from a known answer is more reliable than unconstrained teacher generation.
+- **Reasoner / Verifier** — GT shown as `PRIVATE_GT` but disclosure is forbidden and audited. These tasks are hard enough that reverse-construction from a known answer is more reliable than unconstrained teacher generation.
 
 **Four synthesis quality gates**
 Every teacher response must pass: JSON-parseable → Pydantic schema valid → balance check (Reasoner only, all choices covered) → leakage audit (no GT label in output). Failures are retried up to 2× with bumped temperature, then dropped and logged to `<kind>_synth_log.jsonl`.

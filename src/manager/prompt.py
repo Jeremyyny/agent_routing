@@ -3,7 +3,7 @@
 The manager is a routing + answering agent. It has three native tools:
   - extractor_tool
   - reasoner_tool
-  - rule_applier_tool
+  - verifier_tool
 
 Policy:
   - 0 to 3 tool calls allowed total. Each tool may be called at most once.
@@ -56,9 +56,9 @@ def build_manager_system_prompt(label_keys: List[str], task_description: str = "
     return (
         desc + "\n\n"
         "You have THREE tools available via the native tool-calling interface:\n"
-        "  - extractor_tool: pulls clinical/factual signals from the question (and context, if any).\n"
-        "  - reasoner_tool: produces a structured reasoning scaffold (sub-questions, knowledge, per-choice analysis).\n"
-        "  - rule_applier_tool: identifies applicable rules/criteria and maps facts to their elements.\n\n"
+        "  - extractor_tool: pulls key signals and structures relevant information from the question (and context, if any).\n"
+        "  - reasoner_tool: produces a structured chain-of-thought reasoning scaffold (sub-questions, knowledge, per-choice analysis).\n"
+        "  - verifier_tool: identifies relevant domain principles and audits the reasoning for logical or computational errors.\n\n"
         "Routing policy:\n"
         "  - You may call 0 to 3 tools total. Each tool may be used at most once.\n"
         "  - Prefer answering directly if you are confident.\n"

@@ -54,7 +54,7 @@ def _render_chat(tokenizer, messages, add_generation_prompt: bool) -> str:
 class FrozenSubagent:
     base_model: str
     adapter_path: Optional[str]
-    agent_kind: str             # "extractor" | "reasoner" | "rule_applier"
+    agent_kind: str             # "extractor" | "reasoner" | "verifier"
     device: str = "cuda"
     max_new_tokens: int = 1024
     dtype_str: str = "bfloat16"

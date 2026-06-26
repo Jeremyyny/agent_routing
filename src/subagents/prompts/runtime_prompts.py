@@ -50,13 +50,13 @@ Rules:
 """
 
 
-RULE_APPLIER_RUNTIME_SYSTEM = """You are the RuleApplier sub-agent.
+VERIFIER_RUNTIME_SYSTEM = """You are the Verifier sub-agent.
 
-Given a question (and optional context, choices), identify applicable rules/criteria, map facts to their elements, and produce conditional logic. Output ONLY a JSON object with this schema:
+Given a question (and optional context, choices), identify relevant domain principles, specify concrete checks for a solver's reasoning, and flag common mistake patterns. Output ONLY a JSON object with this schema:
 {
-  "applicable_rules": [{"rule": str, "source": str}],
-  "elements": [{"element": str, "satisfied": "yes"|"no"|"unclear", "evidence": str}],
-  "conclusion_logic": str,
+  "relevant_principles": [{"principle": str, "source": str}],
+  "checks": [{"check": str, "status": "pass"|"fail"|"unclear", "note": str}],
+  "potential_errors": [str],
   "uncertainty_notes": [str],
   "confidence": float
 }
@@ -64,8 +64,9 @@ Given a question (and optional context, choices), identify applicable rules/crit
 Rules:
 - Output ONLY valid JSON.
 - Do NOT state the final answer.
-- conclusion_logic is the conditional chain, not the conclusion.
-- Always produce at least one applicable_rule and one element.
+- relevant_principles must apply regardless of which answer is correct.
+- checks describe what to verify in the reasoning process, not which option wins.
+- potential_errors describe mistake patterns a solver might make.
 """
 
 
@@ -94,7 +95,7 @@ def build_reasoner_runtime_user(question: str, context: str, choices: Dict[str, 
     )
 
 
-def build_rule_applier_runtime_user(question: str, context: str, choices: Dict[str, str]) -> str:
+def build_verifier_runtime_user(question: str, context: str, choices: Dict[str, str]) -> str:
     return (
         f"QUESTION:\n{question}\n\n"
         f"{_format_choices_block(choices)}"
@@ -119,9 +120,9 @@ def build_runtime_messages(
             {"role": "system", "content": REASONER_RUNTIME_SYSTEM},
             {"role": "user", "content": build_reasoner_runtime_user(question, context, choices)},
         ]
-    if agent_kind == "rule_applier":
+    if agent_kind == "verifier":
         return [
-            {"role": "system", "content": RULE_APPLIER_RUNTIME_SYSTEM},
-            {"role": "user", "content": build_rule_applier_runtime_user(question, context, choices)},
+            {"role": "system", "content": VERIFIER_RUNTIME_SYSTEM},
+            {"role": "user", "content": build_verifier_runtime_user(question, context, choices)},
         ]
     raise ValueError(f"Unknown agent_kind: {agent_kind}")

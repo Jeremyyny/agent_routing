@@ -45,13 +45,13 @@ from ..utils.leakage import LeakageAuditor
 
 from .prompts.extractor import build_extractor_synth_prompt
 from .prompts.reasoner import build_reasoner_synth_prompt
-from .prompts.rule_applier import build_rule_applier_synth_prompt
+from .prompts.verifier import build_verifier_synth_prompt
 from .prompts.runtime_prompts import build_runtime_messages
 from .schemas import (
     AgentKind,
     ExtractorOutput,
     ReasonerOutput,
-    RuleApplierOutput,
+    VerifierOutput,
     SCHEMA_REGISTRY,
 )
 
@@ -94,8 +94,8 @@ def _build_teacher_prompt(
         return build_extractor_synth_prompt(row.question, row.context, row.choices)
     if kind == AgentKind.REASONER:
         return build_reasoner_synth_prompt(row.question, row.context, row.choices)
-    if kind == AgentKind.RULE_APPLIER:
-        return build_rule_applier_synth_prompt(row.question, row.context, row.choices)
+    if kind == AgentKind.VERIFIER:
+        return build_verifier_synth_prompt(row.question, row.context, row.choices)
     raise ValueError(f"Unknown kind: {kind}")
 
 

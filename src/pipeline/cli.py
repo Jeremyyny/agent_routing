@@ -118,7 +118,7 @@ def _parse_args() -> argparse.Namespace:
                         choices=["", "anthropic", "claude", "openai", "gpt", "deepseek"])
     parser.add_argument("--teacher_model", type=str, default="")
     parser.add_argument("--agent_kind", type=str, default="",
-                        choices=["", "extractor", "reasoner", "rule_applier"])
+                        choices=["", "extractor", "reasoner", "verifier"])
     parser.add_argument("--n_samples", type=int, default=500)
     parser.add_argument("--synth_temperature", type=float, default=0.4)
     parser.add_argument("--synth_max_retries", type=int, default=2)
@@ -195,7 +195,7 @@ def _parse_args() -> argparse.Namespace:
 
     # Eval
     parser.add_argument("--eval_n_samples", type=int, default=100)
-    parser.add_argument("--eval_kinds", type=str, default="extractor,reasoner,rule_applier")
+    parser.add_argument("--eval_kinds", type=str, default="extractor,reasoner,verifier")
     parser.add_argument("--eval_manager_dir", type=str, default="")
     parser.add_argument("--eval_temperature", type=float, default=0.0)
     parser.add_argument("--eval_max_new_tokens", type=int, default=1024)

@@ -121,16 +121,16 @@ def reasoner_tool(example_id: int) -> str:
     return _run_tool("reasoner", int(example_id))
 
 
-def rule_applier_tool(example_id: int) -> str:
-    """Identify applicable rules and map facts to elements.
+def verifier_tool(example_id: int) -> str:
+    """Audit reasoning for domain principles and potential errors.
 
     Args:
         example_id: The current example's ID from the user message.
 
     Returns:
-        JSON string with applicable rules and element analysis.
+        JSON string with relevant principles, checks, and potential errors.
     """
-    return _run_tool("rule_applier", int(example_id))
+    return _run_tool("verifier", int(example_id))
 
 
 class ManagerToolEnvironment:
@@ -164,13 +164,13 @@ class ManagerToolEnvironment:
         """
         return _run_tool("reasoner", getattr(self, "example_id", -1))
 
-    def rule_applier_tool(self) -> str:
-        """Identify applicable rules for the current example.
+    def verifier_tool(self) -> str:
+        """Audit reasoning for domain principles and potential errors.
 
         Returns:
-            JSON string with rules and element analysis.
+            JSON string with relevant principles, checks, and potential errors.
         """
-        return _run_tool("rule_applier", getattr(self, "example_id", -1))
+        return _run_tool("verifier", getattr(self, "example_id", -1))
 
 
 # ----------------------- Trainer entry point -----------------------
@@ -182,7 +182,7 @@ class ManagerGRPOConfig:
     out_dir: str
     extractor_adapter: Optional[str]
     reasoner_adapter: Optional[str]
-    rule_applier_adapter: Optional[str]
+    verifier_adapter: Optional[str]
     manager_adapter: Optional[str] = None
     fail_buffer_jsonl: Optional[str] = None
     raw_trace_jsonl: Optional[str] = None
@@ -233,7 +233,7 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         # No model weights are loaded here; all VRAM stays available for ZeRO3.
         pool = RemoteSubagentPool(
             server_url=cfg.subagent_server_url,
-            registered_kinds=["extractor", "reasoner", "rule_applier"],
+            registered_kinds=["extractor", "reasoner", "verifier"],
         )
         print(f"[MANAGER_GRPO] using remote subagent pool -> {cfg.subagent_server_url}")
     else:
@@ -242,8 +242,8 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
             pool.register(FrozenSubagent(cfg.base_model, cfg.extractor_adapter, "extractor", device))
         if cfg.reasoner_adapter:
             pool.register(FrozenSubagent(cfg.base_model, cfg.reasoner_adapter, "reasoner", device))
-        if cfg.rule_applier_adapter:
-            pool.register(FrozenSubagent(cfg.base_model, cfg.rule_applier_adapter, "rule_applier", device))
+        if cfg.verifier_adapter:
+            pool.register(FrozenSubagent(cfg.base_model, cfg.verifier_adapter, "verifier", device))
         if not pool._agents:
             raise ValueError(
                 "At least one subagent adapter must be provided, "
@@ -437,7 +437,7 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
             processing_class=manager_tok,
             reward_funcs=reward_funcs,
             rollout_func=None,
-            tools=[extractor_tool, reasoner_tool, rule_applier_tool],
+            tools=[extractor_tool, reasoner_tool, verifier_tool],
         )
 
     trainer.train()

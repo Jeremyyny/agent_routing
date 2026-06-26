@@ -50,7 +50,7 @@ from .prompt import parse_final_answer
 _TOOL_CALL_TAG_RE = re.compile(r"<tool_call>", re.IGNORECASE)
 _TOOLS_TAG_RE = re.compile(r"<tools>", re.IGNORECASE)
 _TOOL_CALLS_FIELD_RE = re.compile(r'"tool_calls"\s*:', re.IGNORECASE)
-_TOOL_NAMES = ("extractor_tool", "reasoner_tool", "rule_applier_tool")
+_TOOL_NAMES = ("extractor_tool", "reasoner_tool", "verifier_tool")
 
 
 def _has_plaintext_tool_artifacts(text: str) -> bool:

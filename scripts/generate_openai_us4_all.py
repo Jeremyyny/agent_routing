@@ -11,7 +11,7 @@ from pathlib import Path
 DEFAULT_MAX_TOKENS = {
     "extractor": 1000,
     "reasoner": 1200,
-    "rule_applier": 1000,
+    "verifier": 1000,
 }
 
 
@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--extractor-max-tokens", type=int, default=DEFAULT_MAX_TOKENS["extractor"])
     parser.add_argument("--reasoner-max-tokens", type=int, default=DEFAULT_MAX_TOKENS["reasoner"])
-    parser.add_argument("--rule-applier-max-tokens", type=int, default=DEFAULT_MAX_TOKENS["rule_applier"])
+    parser.add_argument("--verifier-max-tokens", type=int, default=DEFAULT_MAX_TOKENS["verifier"])
     args = parser.parse_args()
 
     if not os.environ.get("OPENAI_API_KEY"):
@@ -38,7 +38,7 @@ def main() -> None:
     jobs = [
         ("extractor", args.extractor_max_tokens),
         ("reasoner", args.reasoner_max_tokens),
-        ("rule_applier", args.rule_applier_max_tokens),
+        ("verifier", args.verifier_max_tokens),
     ]
 
     for idx, (kind, max_tokens) in enumerate(jobs, start=1):

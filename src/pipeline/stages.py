@@ -30,7 +30,7 @@ from ..manager.prompt import (
 )
 from ..subagents.prompts.extractor import build_extractor_synth_prompt
 from ..subagents.prompts.reasoner import build_reasoner_synth_prompt
-from ..subagents.prompts.rule_applier import build_rule_applier_synth_prompt
+from ..subagents.prompts.verifier import build_verifier_synth_prompt
 from ..subagents.prompts.runtime_prompts import build_runtime_messages
 from ..teachers.base import TeacherClient, build_teacher_client
 from ..utils.cache import TeacherCallCache
@@ -115,8 +115,8 @@ def _build_local_teacher_prompt(
         return build_extractor_synth_prompt(row.question, row.context, row.choices)
     if kind == "reasoner":
         return build_reasoner_synth_prompt(row.question, row.context, row.choices)
-    if kind == "rule_applier":
-        return build_rule_applier_synth_prompt(row.question, row.context, row.choices)
+    if kind == "verifier":
+        return build_verifier_synth_prompt(row.question, row.context, row.choices)
     raise ValueError(f"Unknown agent_kind: {agent_kind}")
 
 def _build_teacher(provider: str, model: str, ctx: StageContext) -> TeacherClient:
@@ -571,7 +571,7 @@ def run_train_manager_grpo(
     manager_adapter: Optional[str] = None,
     extractor_adapter: Optional[str] = None,
     reasoner_adapter: Optional[str] = None,
-    rule_applier_adapter: Optional[str] = None,
+    verifier_adapter: Optional[str] = None,
     per_device_batch_size: int = 2,
     max_completion_length: int = 2048,
     temperature: float = 0.9,
@@ -602,7 +602,7 @@ def run_train_manager_grpo(
         out_dir=out_dir,
         extractor_adapter=extractor_adapter or ctx.adapter_path("extractor"),
         reasoner_adapter=reasoner_adapter or ctx.adapter_path("reasoner"),
-        rule_applier_adapter=rule_applier_adapter or ctx.adapter_path("rule_applier"),
+        verifier_adapter=verifier_adapter or ctx.adapter_path("verifier"),
         manager_adapter=manager_adapter,
         fail_buffer_jsonl=os.path.join(out_dir, "fail_buffer.jsonl"),
         raw_trace_jsonl=os.path.join(out_dir, "train_raw_trace.jsonl"),
@@ -655,7 +655,7 @@ def run_evolve_build_sft(
         base_model=ctx.base_model,
         extractor_adapter=ctx.adapter_path("extractor"),
         reasoner_adapter=ctx.adapter_path("reasoner"),
-        rule_applier_adapter=ctx.adapter_path("rule_applier"),
+        verifier_adapter=ctx.adapter_path("verifier"),
         rows=rows,
         fail_buffer_jsonl=fb,
         out_dir=out_dir,
@@ -698,7 +698,7 @@ def run_manager_coldstart_sft(
         base_model=ctx.base_model,
         extractor_adapter=ctx.adapter_path("extractor"),
         reasoner_adapter=ctx.adapter_path("reasoner"),
-        rule_applier_adapter=ctx.adapter_path("rule_applier"),
+        verifier_adapter=ctx.adapter_path("verifier"),
         rows=rows,
         out_dir=data_dir,
         teacher=teacher,
@@ -1030,8 +1030,8 @@ def _manager_tool_schemas(binding_mode: str) -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "rule_applier_tool",
-                "description": "Identify applicable rules or criteria and map facts to their elements.",
+                "name": "verifier_tool",
+                "description": "Identify relevant domain principles and audit the reasoning for logical or computational errors.",
                 "parameters": {"type": "object", "properties": properties, "required": required},
             },
         },
@@ -1165,7 +1165,7 @@ def run_eval_manager_tools(
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     pool = SubagentPool()
-    for kind in ("extractor", "reasoner", "rule_applier"):
+    for kind in ("extractor", "reasoner", "verifier"):
         adapter = ctx.adapter_path(kind)
         if os.path.exists(adapter):
             pool.register(FrozenSubagent(ctx.base_model, adapter, kind, device))

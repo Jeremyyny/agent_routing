@@ -39,11 +39,11 @@ except Exception:
 from .prompt import build_manager_system_prompt, build_manager_user_message
 
 
-_ALLOWED_TOOLS = ("extractor_tool", "reasoner_tool", "rule_applier_tool")
+_ALLOWED_TOOLS = ("extractor_tool", "reasoner_tool", "verifier_tool")
 _TOOL_NAME_TO_KIND = {
     "extractor_tool": "extractor",
     "reasoner_tool": "reasoner",
-    "rule_applier_tool": "rule_applier",
+    "verifier_tool": "verifier",
 }
 
 
@@ -150,7 +150,7 @@ class EvolveSFTConfig:
     base_model: str
     extractor_adapter: Optional[str]
     reasoner_adapter: Optional[str]
-    rule_applier_adapter: Optional[str]
+    verifier_adapter: Optional[str]
     rows: List[StandardRow]
     fail_buffer_jsonl: str
     out_dir: str
@@ -165,7 +165,7 @@ def _register_available_subagents(
     base_model: str,
     extractor_adapter: Optional[str],
     reasoner_adapter: Optional[str],
-    rule_applier_adapter: Optional[str],
+    verifier_adapter: Optional[str],
     device: str,
 ) -> tuple[SubagentPool, List[str]]:
     pool = SubagentPool()
@@ -176,9 +176,9 @@ def _register_available_subagents(
     if reasoner_adapter:
         pool.register(FrozenSubagent(base_model, reasoner_adapter, "reasoner", device))
         available_kinds.append("reasoner")
-    if rule_applier_adapter:
-        pool.register(FrozenSubagent(base_model, rule_applier_adapter, "rule_applier", device))
-        available_kinds.append("rule_applier")
+    if verifier_adapter:
+        pool.register(FrozenSubagent(base_model, verifier_adapter, "verifier", device))
+        available_kinds.append("verifier")
     return pool, available_kinds
 
 
@@ -188,8 +188,8 @@ def _coldstart_fallback_sequence(idx: int, context: str, available_kinds: List[s
         seq = ["extractor_tool", "reasoner_tool"]
     elif idx % 5 == 0 and "extractor_tool" in available_tools:
         seq = ["extractor_tool", "reasoner_tool"]
-    elif idx % 5 == 1 and "rule_applier_tool" in available_tools:
-        seq = ["rule_applier_tool", "reasoner_tool"]
+    elif idx % 5 == 1 and "verifier_tool" in available_tools:
+        seq = ["verifier_tool", "reasoner_tool"]
     else:
         seq = ["reasoner_tool"]
     return [t for t in seq if t in available_tools][:3]
@@ -307,7 +307,7 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
         cfg.base_model,
         cfg.extractor_adapter,
         cfg.reasoner_adapter,
-        cfg.rule_applier_adapter,
+        cfg.verifier_adapter,
         device,
     )
 
@@ -367,7 +367,7 @@ class ColdStartSFTConfig:
     base_model: str
     extractor_adapter: Optional[str]
     reasoner_adapter: Optional[str]
-    rule_applier_adapter: Optional[str]
+    verifier_adapter: Optional[str]
     rows: List[StandardRow]
     out_dir: str
     teacher: Optional[TeacherClient] = None
@@ -386,7 +386,7 @@ def build_manager_sft_from_rows(cfg: ColdStartSFTConfig) -> str:
         cfg.base_model,
         cfg.extractor_adapter,
         cfg.reasoner_adapter,
-        cfg.rule_applier_adapter,
+        cfg.verifier_adapter,
         device,
     )
     if not available_kinds:
