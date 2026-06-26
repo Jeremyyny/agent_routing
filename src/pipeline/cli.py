@@ -45,6 +45,8 @@ def _parse_args() -> argparse.Namespace:
         "train_subagent",
         "train_manager_grpo",
         "manager_coldstart_sft",
+        "export_manager_coldstart_prompts",
+        "import_manager_coldstart_responses",
         "evolve_build_sft",
         "train_manager_sft",
         "evolve_round",
@@ -190,6 +192,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--fail_buffer_jsonl", type=str, default="",
                         help="Optional explicit GRPO fail_buffer.jsonl path for evolve_build_sft.")
     parser.add_argument("--coldstart_n_samples", type=int, default=300)
+    parser.add_argument("--coldstart_prompt_jsonl", type=str, default="",
+                        help="Prompt JSONL for import_manager_coldstart_responses (output of export_manager_coldstart_prompts).")
+    parser.add_argument("--coldstart_response_jsonl", type=str, default="",
+                        help="Response JSONL for import_manager_coldstart_responses (tool sequences from DeepSeek / batch API).")
+    parser.add_argument("--coldstart_out_jsonl", type=str, default="",
+                        help="Optional explicit output path for the SFT JSONL built by import_manager_coldstart_responses.")
     parser.add_argument("--manager_sft_train_jsonl", type=str, default="",
                         help="Optional explicit manager SFT JSONL for train_manager_sft.")
     parser.add_argument("--manager_sft_lr", type=float, default=2e-5)
@@ -546,6 +554,33 @@ def main() -> None:
             task_description=args.task_description,
         )
         print("[EVOLVE_BUILD_SFT]", result)
+        return
+
+    if args.stage == "export_manager_coldstart_prompts":
+        data = _load_benchmark_splits(args)
+        train_rows = _exclude_sft_rows(data["train"], args.exclude_sft_example_ids)
+        result = stages.run_export_manager_coldstart_prompts(
+            ctx=ctx,
+            rows=train_rows,
+            n_samples=args.coldstart_n_samples,
+            out_path=(args.coldstart_prompt_jsonl or None),
+        )
+        print("[EXPORT_MANAGER_COLDSTART_PROMPTS]", result)
+        return
+
+    if args.stage == "import_manager_coldstart_responses":
+        if not args.coldstart_prompt_jsonl or not args.coldstart_response_jsonl:
+            sys.exit(
+                "import_manager_coldstart_responses requires "
+                "--coldstart_prompt_jsonl and --coldstart_response_jsonl"
+            )
+        result = stages.run_import_manager_coldstart_responses(
+            ctx=ctx,
+            prompt_jsonl=args.coldstart_prompt_jsonl,
+            response_jsonl=args.coldstart_response_jsonl,
+            out_path=(args.coldstart_out_jsonl or None),
+        )
+        print("[IMPORT_MANAGER_COLDSTART_RESPONSES]", result)
         return
 
     if args.stage == "manager_coldstart_sft":

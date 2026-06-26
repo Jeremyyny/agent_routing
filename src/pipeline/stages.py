@@ -671,6 +671,175 @@ def run_evolve_build_sft(
     return {"sft_jsonl": out_path, "out_dir": out_dir}
 
 
+def run_export_manager_coldstart_prompts(
+    ctx: StageContext,
+    rows: List[StandardRow],
+    n_samples: int = 300,
+    out_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Export tool-sequence-selection prompts for offline batch generation.
+
+    Output format mirrors the subagent deepseek export:
+      {"example_id": int, "benchmark_name": str, "question": ..., "context": ...,
+       "choices": {...}, "ground_truth": str, "binding_mode": str,
+       "prompt": [{"role": "system", ...}, {"role": "user", ...}]}
+
+    Feed the output to generate_openai_jsonl.py (or any local model) to get
+    {"example_id": ..., "response": '{"tool_sequence": ["reasoner_tool"]}'} rows,
+    then use run_import_manager_coldstart_responses to build SFT trajectories.
+    """
+    _AVAILABLE_TOOLS = ["extractor_tool", "reasoner_tool", "verifier_tool"]
+
+    sample = list(rows)
+    random.Random(ctx.seed).shuffle(sample)
+    if n_samples > 0:
+        sample = sample[:n_samples]
+
+    if out_path is None:
+        os.makedirs(ctx.evolve_dir(), exist_ok=True)
+        out_path = os.path.join(ctx.evolve_dir(), "coldstart_teacher_prompts.jsonl")
+
+    sys_msg = (
+        "You design efficient tool-use plans for a manager agent.\n"
+        f"Available tools: {_AVAILABLE_TOOLS}.\n"
+        "Choose a sequence of 0 to 3 tools (no repeats) that would best help a "
+        "struggling manager solve the question.\n"
+        "Return ONLY JSON: {\"tool_sequence\": [\"tool_a\", \"tool_b\"]}\n"
+        "Use fewer tools when the question is simple."
+    )
+
+    out_rows: List[Dict[str, Any]] = []
+    for r in sample:
+        choices_block = ""
+        if r.choices:
+            lines = [f"  {k}. {v}" for k, v in r.choices.items()]
+            choices_block = "CHOICES:\n" + "\n".join(lines) + "\n\n"
+        user_msg = (
+            f"QUESTION:\n{r.question}\n\n"
+            f"{choices_block}"
+            f"CONTEXT:\n{r.context if r.context else '(no context)'}\n"
+        )
+        binding = ctx.binding_mode if ctx.binding_mode in ("argument", "environment") else "environment"
+        out_rows.append({
+            "example_id": int(r.example_id),
+            "benchmark_name": r.benchmark_name,
+            "question": r.question,
+            "context": r.context,
+            "choices": dict(r.choices),
+            "ground_truth": r.ground_truth,
+            "binding_mode": binding,
+            "prompt": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        })
+
+    write_jsonl(out_path, out_rows)
+    print(f"[EXPORT_COLDSTART] {len(out_rows)} prompts -> {out_path}")
+    return {"n_rows": len(out_rows), "out_path": out_path}
+
+
+def run_import_manager_coldstart_responses(
+    ctx: StageContext,
+    prompt_jsonl: str,
+    response_jsonl: str,
+    out_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Parse teacher tool-sequence responses, run subagents, build SFT trajectories.
+
+    Input response rows must have {"example_id": ..., "response": '{"tool_sequence": [...]}'}.
+    Subagents are still run locally to produce tool outputs; only the tool *selection*
+    decision comes from the offline-generated response.
+    """
+    from ..manager.evolve import ColdStartSFTConfig, build_manager_sft_from_sequences
+    from ..benchmarks.base import StandardRow as _StandardRow
+
+    prompt_rows = read_jsonl(prompt_jsonl)
+    response_rows = read_jsonl(response_jsonl)
+    prompt_by_id = {
+        int(r["example_id"]): r for r in prompt_rows if r.get("example_id") is not None
+    }
+
+    _ALLOWED = {"extractor_tool", "reasoner_tool", "verifier_tool"}
+    sequences: Dict[int, List[str]] = {}
+    n_parse_fail = 0
+
+    for resp_row in response_rows:
+        eid = resp_row.get("example_id")
+        try:
+            eid_int = int(eid)
+        except Exception:
+            n_parse_fail += 1
+            continue
+        text = str(resp_row.get("response") or "")
+        s = text.find("{")
+        e_idx = text.rfind("}")
+        seq: List[str] = []
+        if s != -1 and e_idx > s:
+            try:
+                obj = json.loads(text[s : e_idx + 1])
+                raw_seq = obj.get("tool_sequence", [])
+                if isinstance(raw_seq, list):
+                    seq = [t for t in raw_seq if t in _ALLOWED][:3]
+                else:
+                    n_parse_fail += 1
+            except Exception:
+                n_parse_fail += 1
+        else:
+            n_parse_fail += 1
+        sequences[eid_int] = seq
+
+    rows_for_build: List[StandardRow] = []
+    for eid_int, src in prompt_by_id.items():
+        if eid_int not in sequences:
+            continue
+        rows_for_build.append(_StandardRow(
+            example_id=eid_int,
+            benchmark_name=str(src.get("benchmark_name") or ""),
+            task_subtype="",
+            question=str(src.get("question") or ""),
+            choices=dict(src.get("choices") or {}),
+            ground_truth=str(src.get("ground_truth") or ""),
+            context=str(src.get("context") or ""),
+        ))
+
+    binding = "environment"
+    if prompt_rows:
+        b = str(prompt_rows[0].get("binding_mode") or "environment")
+        if b in ("argument", "environment"):
+            binding = b
+
+    if out_path is None:
+        out_path = os.path.join(ctx.evolve_dir(), "coldstart_from_responses_sft.jsonl")
+
+    cfg = ColdStartSFTConfig(
+        base_model=ctx.base_model,
+        extractor_adapter=ctx.adapter_path("extractor"),
+        reasoner_adapter=ctx.adapter_path("reasoner"),
+        verifier_adapter=ctx.adapter_path("verifier"),
+        rows=rows_for_build,
+        out_dir=ctx.evolve_dir(),
+        teacher=None,
+        seed=ctx.seed,
+        n_samples=len(rows_for_build),
+        binding_mode=binding,
+        task_description="",
+    )
+    sft_path = build_manager_sft_from_sequences(cfg, sequences, out_path=out_path)
+
+    print(
+        f"[IMPORT_COLDSTART] prompts={len(prompt_rows)} responses={len(response_rows)} "
+        f"parse_fail={n_parse_fail} examples={len(rows_for_build)}"
+    )
+    return {
+        "prompt_jsonl": prompt_jsonl,
+        "response_jsonl": response_jsonl,
+        "sft_jsonl": sft_path,
+        "n_examples": len(rows_for_build),
+        "n_parse_fail": n_parse_fail,
+    }
+
+
 def run_manager_coldstart_sft(
     ctx: StageContext,
     rows: List[StandardRow],

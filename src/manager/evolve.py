@@ -422,6 +422,122 @@ def build_manager_sft_from_rows(cfg: ColdStartSFTConfig) -> str:
     return out_path
 
 
+def build_manager_sft_from_sequences(
+    cfg: ColdStartSFTConfig,
+    sequences: Dict[int, List[str]],
+    out_path: Optional[str] = None,
+) -> str:
+    """Build manager SFT trajectories using pre-computed tool sequences.
+
+    Intended for the offline batch workflow:
+      1. export_manager_coldstart_prompts -> prompts.jsonl
+      2. generate_openai_jsonl.py (or any batch API) -> responses.jsonl
+      3. import_manager_coldstart_responses calls this with parsed sequences
+
+    Subagents are still run locally to produce tool outputs; only the tool
+    *selection* decision comes from the pre-computed sequences.
+    """
+    set_seed(cfg.seed)
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pool, available_kinds = _register_available_subagents(
+        cfg.base_model,
+        cfg.extractor_adapter,
+        cfg.reasoner_adapter,
+        cfg.verifier_adapter,
+        device,
+    )
+    available_tools = {k + "_tool" for k in available_kinds}
+
+    selected = [r for r in cfg.rows if int(r.example_id) in sequences]
+    print(f"[COLDSTART_IMPORT] {len(selected)} examples | subagents={available_kinds}")
+
+    try:
+        from tqdm import tqdm
+        _iter = tqdm(selected, desc="[coldstart_import] building SFT rows", unit="ex")
+    except ImportError:
+        _iter = selected
+
+    sft_rows: List[Dict[str, Any]] = []
+    for row in _iter:
+        eid = int(row.example_id)
+        seq = [t for t in sequences.get(eid, []) if t in available_tools][:3]
+
+        sys_prompt = build_manager_system_prompt(
+            label_keys=list(row.choices.keys()),
+            task_description=cfg.task_description,
+        )
+        user_msg = build_manager_user_message(
+            example_id=eid,
+            question=row.question,
+            context=row.context,
+            choices=row.choices,
+            binding_mode=cfg.binding_mode,
+        )
+        base_messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+
+        tool_outputs: Dict[str, str] = {}
+        for tname in seq:
+            kind = _TOOL_NAME_TO_KIND[tname]
+            if not pool.has(kind):
+                continue
+            tool_outputs[tname] = pool.call(
+                agent_kind=kind,
+                example_id=eid,
+                question=row.question,
+                context=row.context,
+                choices=row.choices,
+                cache_namespace="coldstart_import",
+            )
+
+        final_text = _final_answer_str(row.ground_truth)
+        if not seq:
+            sft_rows.append({
+                "example_id": eid,
+                "prompt": base_messages,
+                "response": [{"role": "assistant", "content": final_text}],
+            })
+            continue
+
+        history = list(base_messages)
+        for i, tname in enumerate(seq):
+            call_id = f"call_{eid}_{i+1}"
+            asst_call = _tool_call_message(tname, eid, call_id, cfg.binding_mode)
+            sft_rows.append({
+                "example_id": eid,
+                "prompt": list(history),
+                "response": [asst_call],
+            })
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": tname,
+                "content": tool_outputs.get(tname, '{"error":"tool_not_available"}'),
+            }
+            history = history + [asst_call, tool_msg]
+
+        sft_rows.append({
+            "example_id": eid,
+            "prompt": list(history),
+            "response": [{"role": "assistant", "content": final_text}],
+        })
+
+    if out_path is None:
+        out_path = os.path.join(cfg.out_dir, "coldstart_from_sequences_sft.jsonl")
+    write_jsonl(out_path, sft_rows)
+    write_json(out_path + ".meta.json", {
+        "n_examples": len(selected),
+        "n_sft_rows": len(sft_rows),
+        "available_kinds": available_kinds,
+        "binding_mode": cfg.binding_mode,
+    })
+    print(f"[COLDSTART_IMPORT] {len(sft_rows)} SFT turns from {len(selected)} examples -> {out_path}")
+    return out_path
+
+
 # -------------- Manager SFT --------------
 
 @dataclass
