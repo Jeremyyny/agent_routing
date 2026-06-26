@@ -21,18 +21,18 @@ PORT=${4:-8000}
 ADAPTER_ROOT="${OUTPUT_ROOT}/adapters/${TEACHER_ID}"
 EXTRACTOR="${ADAPTER_ROOT}/extractor_adapter"
 REASONER="${ADAPTER_ROOT}/reasoner_adapter"
-RULE_APPLIER="${ADAPTER_ROOT}/rule_applier_adapter"
+VERIFIER="${ADAPTER_ROOT}/verifier_adapter"
 
-echo "[vLLM] base_model   = ${BASE_MODEL}"
-echo "[vLLM] teacher_id   = ${TEACHER_ID}"
-echo "[vLLM] extractor    = ${EXTRACTOR}"
-echo "[vLLM] reasoner     = ${REASONER}"
-echo "[vLLM] rule_applier = ${RULE_APPLIER}"
-echo "[vLLM] port         = ${PORT}"
-echo "[vLLM] GPU          = 0"
+echo "[vLLM] base_model = ${BASE_MODEL}"
+echo "[vLLM] teacher_id = ${TEACHER_ID}"
+echo "[vLLM] extractor  = ${EXTRACTOR}"
+echo "[vLLM] reasoner   = ${REASONER}"
+echo "[vLLM] verifier   = ${VERIFIER}"
+echo "[vLLM] port       = ${PORT}"
+echo "[vLLM] GPU        = 0"
 
 # Verify adapter directories exist before launching.
-for DIR in "${EXTRACTOR}" "${REASONER}" "${RULE_APPLIER}"; do
+for DIR in "${EXTRACTOR}" "${REASONER}" "${VERIFIER}"; do
     if [ ! -d "${DIR}" ]; then
         echo "[vLLM] ERROR: adapter directory not found: ${DIR}"
         exit 1
@@ -46,7 +46,7 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
     --lora-modules \
         extractor="${EXTRACTOR}" \
         reasoner="${REASONER}" \
-        rule_applier="${RULE_APPLIER}" \
+        verifier="${VERIFIER}" \
     --port "${PORT}" \
     --dtype bfloat16 \
     --trust-remote-code \
