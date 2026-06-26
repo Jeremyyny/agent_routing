@@ -393,54 +393,154 @@ python -m src.pipeline.cli eval_manager_tools \
 
 ---
 
-## MMLU-Pro: evaluation only (zero-shot generalisation)
+## MMLU-Pro: full end-to-end pipeline
 
-MMLU-Pro is used **as an evaluation benchmark only**. Training on any portion of its test set breaks comparability with the literature. The goal is to show that a CCR routing policy trained on MedQA or LegalBench generalises — without any MMLU-Pro training data — to a 10-option broad-knowledge benchmark.
+MMLU-Pro has ~12,032 questions in its `test` split (10 options A–J, 14 categories). The dataset is **public** — no login required.
+
+Data allocation from the 12k test split:
+
+| Stage | Count |
+|---|---|
+| Subagent SFT × 3 agents | 500 × 3 = 1,500 |
+| Manager cold-start | 300 |
+| Manager GRPO train | 600 |
+| Dev | 200 |
+| **Eval (held-out)** | **500** |
+| Total drawn | 3,100 (of 12,032) |
 
 ```bash
+# ── configure ────────────────────────────────────────────────────────────────
+export TEACHER_ID=mmlu_pro_claude
+export PROVIDER=anthropic
+export MODEL=claude-sonnet-4-5
 export BASE_MODEL=Qwen/Qwen3-8B
-export TEACHER_ID=claude_sonnet_4_5       # reuse the MedQA-trained manager
-export TASK_DESC="You are a manager agent solving multiple-choice questions across diverse academic subjects."
+export CACHE=outputs/data/mmlu_pro_normalized.jsonl
+export TASK_DESC="You are a manager agent solving multiple-choice questions across diverse academic subjects. Each question has 10 options (A–J)."
 export PYTHONUTF8=1
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Step 1 — download and cache MMLU-Pro test split (500 examples, stratified)
+# Step 1 — download and cache (train=1800 / dev=200 / test=500 from the 12k test split)
 python -m src.pipeline.cli load_mmlu_pro \
     --base_model "$BASE_MODEL" \
-    --mmlu_pro_normalized_cache outputs/data/mmlu_pro_normalized.jsonl \
+    --mmlu_pro_normalized_cache "$CACHE" \
     --mmlu_pro_splits "test" \
-    --mmlu_pro_max 500 \
-    --test_size 500 --train_size 0 --dev_size 0
+    --train_size 1800 --dev_size 200 --test_size 500
 
-# Step 2 — evaluate the MedQA-trained manager on MMLU-Pro (zero-shot transfer)
+# Step 2 — synthesize Extractor SFT data (500 examples)
+python -m src.pipeline.cli synth_subagent \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --teacher_provider "$PROVIDER" --teacher_model "$MODEL" \
+    --agent_kind extractor --n_samples 500 \
+    --mmlu_pro_normalized_cache "$CACHE" \
+    --train_size 1800 --dev_size 200 --test_size 500 \
+    --task_description "$TASK_DESC"
+
+# Step 3 — synthesize Reasoner SFT data (500 examples)
+python -m src.pipeline.cli synth_subagent \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --teacher_provider "$PROVIDER" --teacher_model "$MODEL" \
+    --agent_kind reasoner --n_samples 500 \
+    --mmlu_pro_normalized_cache "$CACHE" \
+    --train_size 1800 --dev_size 200 --test_size 500 \
+    --task_description "$TASK_DESC"
+
+# Step 4 — synthesize Verifier SFT data (500 examples)
+python -m src.pipeline.cli synth_subagent \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --teacher_provider "$PROVIDER" --teacher_model "$MODEL" \
+    --agent_kind verifier --n_samples 500 \
+    --mmlu_pro_normalized_cache "$CACHE" \
+    --train_size 1800 --dev_size 200 --test_size 500 \
+    --task_description "$TASK_DESC"
+
+# Step 5 — SFT-train all three subagents
+python -m src.pipeline.cli train_subagent \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" --agent_kind extractor \
+    --sft_epochs 3 --sft_lr 2e-4
+
+python -m src.pipeline.cli train_subagent \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" --agent_kind reasoner \
+    --sft_epochs 3 --sft_lr 2e-4
+
+python -m src.pipeline.cli train_subagent \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" --agent_kind verifier \
+    --sft_epochs 3 --sft_lr 2e-4
+
+# Step 6 — validate subagents (json_ok_rate and schema_ok_rate should be > 0.9)
+python -m src.pipeline.cli eval_subagents \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --mmlu_pro_normalized_cache "$CACHE" \
+    --eval_n_samples 50
+
+# Step 7 — manager cold-start SFT (300 examples, non-overlapping with subagent SFT data)
+python -m src.pipeline.cli manager_coldstart_sft \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --mmlu_pro_normalized_cache "$CACHE" \
+    --train_size 1800 --dev_size 200 --test_size 500 \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl" \
+    --coldstart_n_samples 300 \
+    --task_description "$TASK_DESC"
+
+python -m src.pipeline.cli train_manager_sft \
+    --base_model "$BASE_MODEL" \
+    --teacher_id "$TEACHER_ID" \
+    --manager_sft_train_jsonl "outputs/manager/${TEACHER_ID}/evolve/manager_sft_coldstart.jsonl" \
+    --manager_sft_epochs 1 --manager_sft_lr 2e-5
+
+# Step 8 — GRPO + CCR (600 train rows, non-overlapping)
+# Terminal A: bash scripts/start_subagent_server.sh "$BASE_MODEL" "$TEACHER_ID"
+# Terminal B:
+bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
+    --base_model "$BASE_MODEL" \
+    --mmlu_pro_normalized_cache "$CACHE" \
+    --train_size 600 --dev_size 200 --test_size 500 \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
+    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl" \
+    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_coldstart" \
+    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
+    --mgr_ccr_mode --mgr_ccr_p_high 0.9 --mgr_ccr_p_low 0.2 \
+    --mgr_bs 2 --mgr_num_generations 6 \
+    --mgr_max_steps 300 \
+    --mgr_use_wandb --wandb_project agent_routing \
+    --wandb_run_name "${TEACHER_ID}_mmlu_pro_ccr" \
+    --task_description "$TASK_DESC"
+
+# Step 9 — evaluate on 500-example held-out test set
 python -m src.pipeline.cli eval_manager_tools \
     --base_model "$BASE_MODEL" \
     --teacher_id "$TEACHER_ID" \
-    --mmlu_pro_normalized_cache outputs/data/mmlu_pro_normalized.jsonl \
+    --mmlu_pro_normalized_cache "$CACHE" \
     --eval_n_samples 500 --test_size 500 \
     --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_ccr" \
     --task_description "$TASK_DESC"
-
-# Results:
-#   outputs/eval/$TEACHER_ID/manager_tool_eval_report.json  ← accuracy, avg_tool_calls
-#   outputs/eval/$TEACHER_ID/manager_tool_eval.jsonl        ← per-example detail
 ```
 
-**What to look for in the results:**
+**Check calibration metrics after eval:**
 
 ```python
 from src.utils.io import read_jsonl
 from src.manager.reward import compute_ece, compute_routing_entropy
 
-records = read_jsonl("outputs/eval/<teacher_id>/manager_tool_eval.jsonl")
-# eval_manager_tools logs correct/tool_calls per example — compute calibration metrics
+records = read_jsonl("outputs/eval/mmlu_pro_claude/manager_tool_eval.jsonl")
 ece = compute_ece(records, p_high=0.9, p_low=0.2)
 ent = compute_routing_entropy(records)
 print(f"ECE = {ece['ece']:.3f}")
 print(f"Routing entropy (normalized) = {ent['normalized_entropy']:.3f}")
-# Expected: higher entropy than MedQA (10-option questions are harder)
+# Expected normalized entropy: 0.6–0.8 (harder than MedQA, 10 options)
 ```
 
-> **If you want a per-category breakdown**, filter `records` by `task_subtype` (which contains the MMLU-Pro category name) before calling `compute_ece`.
+> **Per-category breakdown**: filter `records` by `task_subtype` before calling `compute_ece`. Each record's `task_subtype` contains the MMLU-Pro category (e.g., `"math"`, `"physics"`).
 
 ---
 
