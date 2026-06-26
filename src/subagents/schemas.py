@@ -8,7 +8,7 @@ the manager is the sole authority on the final ANSWER_<TOKEN> output.
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Optional
+from typing import List
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -22,7 +22,7 @@ class AgentKind(str, Enum):
 # ---------- Extractor ----------
 
 class ExtractedEvidence(BaseModel):
-    text: str = Field(..., max_length=400)
+    text: str
     relevance: float = Field(..., ge=0.0, le=1.0)
     polarity: str = Field(..., description="support | oppose | neutral")
 
@@ -36,70 +36,42 @@ class ExtractedEvidence(BaseModel):
 
 
 class ExtractorOutput(BaseModel):
-    """Output schema for ExtractorAgent.
-
-    On MedQA (closed-book): `key_evidence` is empty, `extracted_facts` carries
-    clinical facts pulled from the question stem.
-    On PubMedQA / LegalBench / LawBench: `key_evidence` carries the salient
-    sentences from the long context.
-    """
-    key_evidence: List[ExtractedEvidence] = Field(default_factory=list, max_length=8)
-    extracted_facts: List[str] = Field(default_factory=list, max_length=12)
-    missing_info: List[str] = Field(default_factory=list, max_length=6)
-    context_summary: str = Field(default="", max_length=400)
+    key_evidence: List[ExtractedEvidence] = Field(default_factory=list)
+    extracted_facts: List[str] = Field(default_factory=list)
+    missing_info: List[str] = Field(default_factory=list)
+    context_summary: str = Field(default="")
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-
-    @field_validator("extracted_facts", "missing_info")
-    @classmethod
-    def _trim_lines(cls, v: List[str]) -> List[str]:
-        return [str(s)[:240].strip() for s in v if str(s).strip()]
 
 
 # ---------- Reasoner ----------
 
 class CandidateConsideration(BaseModel):
-    """Neutral per-choice conditions, used when the input is MCQ.
-
-    This is intentionally weaker than support/against. The goal is to teach a
-    small subagent to map each option to conditions under which it matters,
-    without making one option read like the answer.
-    """
-    choice_key: str = Field(..., max_length=16)
-    relevant_if: List[str] = Field(default_factory=list, max_length=3)
-    less_relevant_if: List[str] = Field(default_factory=list, max_length=3)
-
-    @field_validator("relevant_if", "less_relevant_if")
-    @classmethod
-    def _trim_conditionals(cls, v: List[str]) -> List[str]:
-        return [str(s)[:180].strip() for s in v if str(s).strip()]
+    choice_key: str
+    relevant_if: List[str] = Field(default_factory=list)
+    less_relevant_if: List[str] = Field(default_factory=list)
 
 
 class ReasonerOutput(BaseModel):
-    case_facts: List[str] = Field(default_factory=list, max_length=8)
-    task_type: str = Field(default="", max_length=64)
-    decision_factors: List[str] = Field(default_factory=list, max_length=8)
-    knowledge_slots: List[str] = Field(default_factory=list, max_length=6)
-    candidate_considerations: List[CandidateConsideration] = Field(default_factory=list, max_length=12)
-    missing_information: List[str] = Field(default_factory=list, max_length=4)
+    case_facts: List[str] = Field(default_factory=list)
+    task_type: str = Field(default="")
+    decision_factors: List[str] = Field(default_factory=list)
+    knowledge_slots: List[str] = Field(default_factory=list)
+    candidate_considerations: List[CandidateConsideration] = Field(default_factory=list)
+    missing_information: List[str] = Field(default_factory=list)
     format_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-
-    @field_validator("case_facts", "decision_factors", "knowledge_slots", "missing_information")
-    @classmethod
-    def _trim_lines(cls, v: List[str]) -> List[str]:
-        return [str(s)[:220].strip() for s in v if str(s).strip()]
 
 
 # ---------- Verifier ----------
 
 class RelevantPrinciple(BaseModel):
-    principle: str = Field(..., max_length=200)
-    source: str = Field(default="", max_length=120)
+    principle: str
+    source: str = Field(default="")
 
 
 class VerifierCheck(BaseModel):
-    check: str = Field(..., max_length=200)
+    check: str
     status: str = Field(..., description="pass | fail | unclear")
-    note: str = Field(default="", max_length=200)
+    note: str = Field(default="")
 
     @field_validator("status")
     @classmethod
@@ -109,16 +81,11 @@ class VerifierCheck(BaseModel):
 
 
 class VerifierOutput(BaseModel):
-    relevant_principles: List[RelevantPrinciple] = Field(default_factory=list, max_length=6)
-    checks: List[VerifierCheck] = Field(default_factory=list, max_length=8)
-    potential_errors: List[str] = Field(default_factory=list, max_length=4)
-    uncertainty_notes: List[str] = Field(default_factory=list, max_length=4)
+    relevant_principles: List[RelevantPrinciple] = Field(default_factory=list)
+    checks: List[VerifierCheck] = Field(default_factory=list)
+    potential_errors: List[str] = Field(default_factory=list)
+    uncertainty_notes: List[str] = Field(default_factory=list)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-
-    @field_validator("potential_errors", "uncertainty_notes")
-    @classmethod
-    def _trim(cls, v: List[str]) -> List[str]:
-        return [str(s)[:200].strip() for s in v if str(s).strip()]
 
 
 SCHEMA_REGISTRY = {

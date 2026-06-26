@@ -274,6 +274,7 @@ def run_synthesize_subagent(
     base_temperature: float = 0.4,
     max_retries: int = 2,
     use_cache: bool = True,
+    max_workers: int = 8,
 ) -> Dict[str, Any]:
     from ..subagents.schemas import AgentKind
     from ..subagents.synthesize import synthesize_subagent_data
@@ -298,6 +299,7 @@ def run_synthesize_subagent(
         max_retries_per_sample=max_retries,
         seed=ctx.seed,
         log_path=log_path,
+        max_workers=max_workers,
     )
 
     return {

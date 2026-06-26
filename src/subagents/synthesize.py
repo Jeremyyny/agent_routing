@@ -28,9 +28,12 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import random
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -154,8 +157,8 @@ def _agent_default_max_tokens(kind: AgentKind) -> int:
         return 1200
     if kind == AgentKind.REASONER:
         return 2200
-    if kind == AgentKind.RULE_APPLIER:
-        return 1800
+    if kind == AgentKind.VERIFIER:
+        return 1000
     return 1500
 
 
@@ -171,6 +174,7 @@ def synthesize_subagent_data(
     max_retries_per_sample: int = 2,
     seed: int = 42,
     log_path: Optional[str] = None,
+    max_workers: int = 8,
 ) -> SynthStats:
     """Synthesize SFT data for one subagent.
 
@@ -197,12 +201,11 @@ def synthesize_subagent_data(
     rng.shuffle(pool)
 
     stats = SynthStats(requested=n_samples)
-    accepted: List[Dict[str, Any]] = []
-    pool_idx = 0
+    _lock = threading.Lock()
+    _succeeded_count = [0]  # mutable int for thread-safe check
     progress = tqdm(total=n_samples, desc=f"synth/{agent_kind.value}", ncols=100)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    # Truncate output file at start
     with open(out_path, "w", encoding="utf-8"):
         pass
     if log_path:
@@ -210,14 +213,14 @@ def synthesize_subagent_data(
         with open(log_path, "w", encoding="utf-8"):
             pass
 
-    while len(accepted) < n_samples and pool_idx < len(pool):
-        row = pool[pool_idx]
-        pool_idx += 1
-
-        success_obj: Optional[Dict[str, Any]] = None
-        last_failure_reason = ""
-
+    def _process_one(row: StandardRow) -> Optional[Dict[str, Any]]:
+        """Try up to max_retries_per_sample+1 times. Return sft_row dict or None."""
         for attempt in range(max_retries_per_sample + 1):
+            # Stop early if we already have enough successes
+            with _lock:
+                if _succeeded_count[0] >= n_samples:
+                    return None
+
             temperature = min(0.95, base_temperature + 0.15 * attempt)
             messages = _build_teacher_prompt(agent_kind, row)
 
@@ -231,7 +234,6 @@ def synthesize_subagent_data(
 
             if cached_resp is not None:
                 text = cached_resp.get("text", "")
-                resp_meta = {"cached": True, **cached_resp.get("raw", {})}
             else:
                 try:
                     resp: TeacherResponse = teacher.chat(
@@ -240,64 +242,67 @@ def synthesize_subagent_data(
                         max_tokens=_agent_default_max_tokens(agent_kind),
                     )
                     text = resp.text
-                    resp_meta = {"cached": False, **(resp.raw or {})}
                     if cache is not None and cache_key:
                         cache.put(cache_key, {"text": text, "raw": resp.raw})
                 except Exception as e:
-                    stats.teacher_error += 1
-                    last_failure_reason = f"teacher_error: {e}"
+                    with _lock:
+                        stats.teacher_error += 1
                     if log_path:
+                        with _lock:
+                            append_jsonl(log_path, [{
+                                "ts": int(time.time()),
+                                "example_id": row.example_id,
+                                "agent_kind": agent_kind.value,
+                                "attempt": attempt,
+                                "error": f"teacher_error: {e}",
+                            }])
+                    continue
+
+            obj = _extract_first_json(text)
+            if obj is None:
+                with _lock:
+                    stats.json_parse_fail += 1
+                if log_path:
+                    with _lock:
                         append_jsonl(log_path, [{
                             "ts": int(time.time()),
                             "example_id": row.example_id,
                             "agent_kind": agent_kind.value,
                             "attempt": attempt,
-                            "error": last_failure_reason,
+                            "error": "json_parse_fail",
+                            "text_preview": text[:400],
                         }])
-                    continue
-
-            obj = _extract_first_json(text)
-            if obj is None:
-                stats.json_parse_fail += 1
-                last_failure_reason = "json_parse_fail"
-                if log_path:
-                    append_jsonl(log_path, [{
-                        "ts": int(time.time()),
-                        "example_id": row.example_id,
-                        "agent_kind": agent_kind.value,
-                        "attempt": attempt,
-                        "error": last_failure_reason,
-                        "text_preview": text[:400],
-                    }])
                 continue
 
             try:
-                model = _validate_schema(agent_kind, obj)
+                validated = _validate_schema(agent_kind, obj)
             except ValidationError as e:
-                stats.schema_fail += 1
-                last_failure_reason = f"schema_fail: {e.errors()[:2]}"
+                with _lock:
+                    stats.schema_fail += 1
                 if log_path:
-                    append_jsonl(log_path, [{
-                        "ts": int(time.time()),
-                        "example_id": row.example_id,
-                        "agent_kind": agent_kind.value,
-                        "attempt": attempt,
-                        "error": "schema_fail",
-                    }])
+                    with _lock:
+                        append_jsonl(log_path, [{
+                            "ts": int(time.time()),
+                            "example_id": row.example_id,
+                            "agent_kind": agent_kind.value,
+                            "attempt": attempt,
+                            "error": "schema_fail",
+                        }])
                 continue
 
             ok_balance, balance_msg = _reasoner_choice_coverage_check(agent_kind, obj, row)
             if not ok_balance:
-                stats.balance_fail += 1
-                last_failure_reason = f"balance_fail: {balance_msg}"
+                with _lock:
+                    stats.balance_fail += 1
                 if log_path:
-                    append_jsonl(log_path, [{
-                        "ts": int(time.time()),
-                        "example_id": row.example_id,
-                        "agent_kind": agent_kind.value,
-                        "attempt": attempt,
-                        "error": last_failure_reason,
-                    }])
+                    with _lock:
+                        append_jsonl(log_path, [{
+                            "ts": int(time.time()),
+                            "example_id": row.example_id,
+                            "agent_kind": agent_kind.value,
+                            "attempt": attempt,
+                            "error": f"balance_fail: {balance_msg}",
+                        }])
                 continue
 
             kw = _gt_audit_keywords(row)
@@ -308,44 +313,54 @@ def synthesize_subagent_data(
                 token_form=kw["token_form"],
             )
             if audit.leaked:
-                stats.leakage_fail += 1
-                last_failure_reason = f"leakage_fail: {audit.matches[:3]}"
+                with _lock:
+                    stats.leakage_fail += 1
                 if log_path:
-                    append_jsonl(log_path, [{
-                        "ts": int(time.time()),
-                        "example_id": row.example_id,
-                        "agent_kind": agent_kind.value,
-                        "attempt": attempt,
-                        "error": last_failure_reason,
-                    }])
+                    with _lock:
+                        append_jsonl(log_path, [{
+                            "ts": int(time.time()),
+                            "example_id": row.example_id,
+                            "agent_kind": agent_kind.value,
+                            "attempt": attempt,
+                            "error": f"leakage_fail: {audit.matches[:3]}",
+                        }])
                 continue
 
-            # Validated, balanced, no leakage. Use the validated dict.
-            success_obj = model.model_dump()
-            break
+            # Success
+            success_obj = validated.model_dump()
+            runtime_prompt = build_runtime_messages(
+                agent_kind=agent_kind.value,
+                question=row.question,
+                context=row.context,
+                choices=row.choices,
+            )
+            return {
+                "example_id": int(row.example_id),
+                "benchmark_name": row.benchmark_name,
+                "agent_kind": agent_kind.value,
+                "teacher_provider": teacher.provider,
+                "teacher_model": teacher.model,
+                "prompt": runtime_prompt,
+                "response": json.dumps(success_obj, ensure_ascii=False),
+            }
 
-        if success_obj is None:
-            continue
+        return None
 
-        runtime_prompt = build_runtime_messages(
-            agent_kind=agent_kind.value,
-            question=row.question,
-            context=row.context,
-            choices=row.choices,
-        )
-        sft_row = {
-            "example_id": int(row.example_id),
-            "benchmark_name": row.benchmark_name,
-            "agent_kind": agent_kind.value,
-            "teacher_provider": teacher.provider,
-            "teacher_model": teacher.model,
-            "prompt": runtime_prompt,
-            "response": json.dumps(success_obj, ensure_ascii=False),
-        }
-        accepted.append(sft_row)
-        append_jsonl(out_path, [sft_row])
-        stats.succeeded += 1
-        progress.update(1)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_process_one, row): row for row in pool}
+        for future in as_completed(futures):
+            with _lock:
+                if _succeeded_count[0] >= n_samples:
+                    future.cancel()
+                    continue
+            sft_row = future.result()
+            if sft_row is not None:
+                with _lock:
+                    if _succeeded_count[0] < n_samples:
+                        append_jsonl(out_path, [sft_row])
+                        stats.succeeded += 1
+                        _succeeded_count[0] += 1
+                        progress.update(1)
 
     progress.close()
 
@@ -357,7 +372,7 @@ def synthesize_subagent_data(
         "teacher_model": teacher.model,
         "n_requested": n_samples,
         "n_pool": len(pool),
-        "n_accepted": len(accepted),
+        "n_accepted": stats.succeeded,
         "stats": asdict(stats),
         "gt_visible_to_teacher": False,
     })

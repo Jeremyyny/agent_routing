@@ -122,6 +122,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n_samples", type=int, default=500)
     parser.add_argument("--synth_temperature", type=float, default=0.4)
     parser.add_argument("--synth_max_retries", type=int, default=2)
+    parser.add_argument("--synth_workers", type=int, default=8,
+                        help="Parallel teacher API calls during synthesis (default 8).")
     parser.add_argument("--synth_no_cache", action="store_true")
     parser.add_argument("--deepseek_prompt_jsonl", type=str, default="",
                         help="Prompt JSONL for local DeepSeek batch generation.")
@@ -447,6 +449,7 @@ def main() -> None:
             base_temperature=args.synth_temperature,
             max_retries=args.synth_max_retries,
             use_cache=(not args.synth_no_cache),
+            max_workers=args.synth_workers,
         )
         print("[SYNTH]", result)
         return
