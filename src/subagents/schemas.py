@@ -79,7 +79,7 @@ class ReasonerOutput(BaseModel):
     task_type: str = Field(default="", max_length=64)
     decision_factors: List[str] = Field(default_factory=list, max_length=8)
     knowledge_slots: List[str] = Field(default_factory=list, max_length=6)
-    candidate_considerations: List[CandidateConsideration] = Field(default_factory=list, max_length=8)
+    candidate_considerations: List[CandidateConsideration] = Field(default_factory=list, max_length=12)
     missing_information: List[str] = Field(default_factory=list, max_length=4)
     format_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
